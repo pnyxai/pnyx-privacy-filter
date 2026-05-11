@@ -1,0 +1,38 @@
+name: "main_model"
+backend: "onnxruntime"
+max_batch_size: ${MAX_BATCH_SIZE}
+
+# Input names MUST match the ONNX graph input node names exactly.
+input [
+  {
+    name: "input_ids"
+    data_type: TYPE_INT64
+    dims: [ -1 ]
+  },
+  {
+    name: "attention_mask"
+    data_type: TYPE_INT64
+    dims: [ -1 ]
+  }
+]
+
+# model_fp16.onnx casts logits to float32 before output (verified via ONNX graph).
+output [
+  {
+    name: "logits"
+    data_type: TYPE_FP32
+    dims: [ -1, 33 ]
+  }
+]
+
+instance_group [
+  {
+    kind: KIND_GPU
+    count: ${INSTANCE_COUNT}
+  }
+]
+
+dynamic_batching {
+  preferred_batch_size: [ ${MAX_BATCH_SIZE} ]
+  max_queue_delay_microseconds: 250000
+}

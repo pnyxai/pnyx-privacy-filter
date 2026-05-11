@@ -1,0 +1,54 @@
+name: "postprocessing_model"
+backend: "python"
+max_batch_size: ${MAX_BATCH_SIZE}
+
+input [
+  {
+    name: "LOGITS"
+    data_type: TYPE_FP32
+    dims: [ -1, 33 ]
+  },
+  {
+    name: "INPUT_IDS"
+    data_type: TYPE_INT64
+    dims: [ -1 ]
+  },
+  {
+    name: "ATTN_MASK"
+    data_type: TYPE_INT64
+    dims: [ -1 ]
+  },
+  {
+    name: "PROMPT"
+    data_type: TYPE_STRING
+    dims: [ 1 ]
+  }
+]
+
+output [
+  {
+    name: "LABELS"
+    data_type: TYPE_STRING
+    dims: [ 1 ]
+  }
+]
+
+instance_group [
+  {
+    kind: KIND_CPU
+    count: 1
+  }
+]
+
+dynamic_batching {
+  preferred_batch_size: [ 2 ]
+  max_queue_delay_microseconds: 250000
+}
+
+parameters: {
+  key: "EXECUTION_ENV_PATH"
+  value: {
+    string_value: "/opt/pnyx_pf.tar.gz"
+  }
+}
+default_model_filename: "model.py"

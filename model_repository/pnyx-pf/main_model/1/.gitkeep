@@ -1,0 +1,8 @@
+# Weights are symlinked at container start via WEIGHT_MAPPINGS env var.
+# Required symlinks in this directory:
+#   model.onnx           -> /mnt/models/onnx/model_fp16.onnx
+#   model_fp16.onnx_data -> /mnt/models/onnx/model_fp16.onnx_data
+#   model_fp16.onnx_data_1 -> /mnt/models/onnx/model_fp16.onnx_data_1
+#
+# Example WEIGHT_MAPPINGS value:
+#   onnx/model_fp16.onnx=main_model/1/model.onnx,onnx/model_fp16.onnx_data=main_model/1/model_fp16.onnx_data,onnx/model_fp16.onnx_data_1=main_model/1/model_fp16.onnx_data_1

@@ -1,0 +1,15 @@
+# Core Python dependencies for the pnyx_pf conda environment.
+# torch is installed separately with the CPU-only index URL BEFORE this file is
+# processed, so that opf (privacy-filter) is installed with --no-deps and does
+# NOT pull in the multi-GB CUDA torch distribution.
+#
+# opf non-torch transitive deps are listed here explicitly so they are still
+# resolved and installed correctly.
+#
+# Add any additional packages here if needed by custom model logic.
+huggingface_hub
+numpy
+packaging
+safetensors
+tiktoken
+transformers==5.6.2

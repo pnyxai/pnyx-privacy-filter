@@ -1,0 +1,14 @@
+{
+  "operating_points": {
+    "default": {
+      "biases": {
+        "transition_bias_background_stay": 0.0,
+        "transition_bias_background_to_start": 0.0,
+        "transition_bias_end_to_background": 0.0,
+        "transition_bias_end_to_start": 0.0,
+        "transition_bias_inside_to_continue": 0.0,
+        "transition_bias_inside_to_end": 0.0
+      }
+    }
+  }
+}

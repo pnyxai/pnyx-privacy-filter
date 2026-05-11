@@ -1,0 +1,165 @@
+
+networks:
+  pnyx-net-pf:
+    name: pnyx-net-pf
+    driver: bridge
+
+volumes:
+  pcm-data:
+    # Named volume for the PCM SQLite session database.
+    # Replace with a bind mount if you need direct host access:
+    #   driver: local
+    #   driver_opts:
+    #     type: none
+    #     o: bind
+    #     device: /path/on/host
+  open-webui-data:
+
+services:
+
+  # ──────────────────────────────────────────────────────────────────────────
+  # Triton Inference Server — privacy-filter model
+  # ──────────────────────────────────────────────────────────────────────────
+  pnyx-pf-triton:
+    image: pnyx-pf-triton:latest
+    container_name: pnyx-pf-triton
+    restart: unless-stopped
+    networks:
+      - pnyx-net-pf
+    # Triton ports are NOT needed for PCM→Triton traffic (same Docker network).
+    # Uncomment only if you need to call Triton directly from the host.
+    # ports:
+    #   - "8000:8000"   # HTTP inference
+    #   - "8001:8001"   # gRPC inference
+    #   - "8002:8002"   # Metrics
+    volumes:
+      - type: bind
+        source: ${TRITON_MODELS_PATH}
+        target: /mnt/models
+        read_only: true
+    environment:
+      MODEL_TYPE:           ${TRITON_MODEL_TYPE}
+      MAX_BATCH_SIZE:       ${TRITON_MAX_BATCH_SIZE}
+      INSTANCE_COUNT:       ${TRITON_INSTANCE_COUNT}
+      MAX_SEQUENCE_LENGTH:  ${TRITON_MAX_SEQUENCE_LENGTH}
+      WEIGHT_MAPPINGS:      ${TRITON_WEIGHT_MAPPINGS}
+      HF_TOKEN:             ${HF_TOKEN}
+    # Remove or adjust the deploy block if no GPU is available.
+    deploy:
+      resources:
+        reservations:
+          devices:
+            - driver: nvidia
+              count: 1
+              capabilities: [gpu]
+    shm_size: "2gb"
+    healthcheck:
+      test: ["CMD", "curl", "-f", "http://localhost:8000/v2/health/ready"]
+      interval: 15s
+      timeout: 5s
+      retries: 10
+      start_period: 60s
+
+  # ──────────────────────────────────────────────────────────────────────────
+  # PrivateChatManager — privacy-aware LLM proxy
+  # ──────────────────────────────────────────────────────────────────────────
+  pnyx-pcm:
+    image: pnyx-pcm:latest
+    container_name: pnyx-pcm
+    restart: unless-stopped
+    networks:
+      - pnyx-net-pf
+    ports:
+      - "8080:8080"   # PCM HTTP API
+    volumes:
+      - pcm-data:/data
+    environment:
+      PCM_LLM_URL:          ${PCM_LLM_URL}
+      PCM_LLM_MODEL_NAME:   ${PCM_LLM_MODEL_NAME}
+      PCM_LLM_API_KEY:      ${PCM_LLM_API_KEY}
+      # PCM talks to Triton by service name on the shared network
+      PCM_TRITON_URL:       pnyx-pf-triton:8000
+      PCM_TRITON_MODEL_NAME: ensemble_model
+      PCM_DB_PATH:          ${PCM_DB_PATH}
+      PCM_LOG_LEVEL:        ${PCM_LOG_LEVEL}
+      # Comma-separated verbose event names to emit at DEBUG level (requires PCM_LOG_LEVEL=DEBUG).
+      # Available: request_body, redaction_result, llm_payload, llm_raw_response, session_state, response_body
+      # Use * to enable all. Default: empty (none).
+      PCM_VERBOSE_LOG_EVENTS: ${PCM_VERBOSE_LOG_EVENTS}
+      # Comma-separated roles sent through the Triton privacy filter.
+      # Default: user,tool,function — add "system" to also redact system prompts.
+      PCM_FILTERABLE_ROLES: ${PCM_FILTERABLE_ROLES}
+    # Allows the container to reach services bound on the host
+    # Set PCM_LLM_URL=http://host.docker.internal:<port> in your .env.
+    extra_hosts:
+      - "host.docker.internal:host-gateway"
+    depends_on:
+      pnyx-pf-triton:
+        condition: service_healthy
+    healthcheck:
+      test: ["CMD", "curl", "-f", "http://localhost:8080/health"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+      start_period: 10s
+
+  # ──────────────────────────────────────────────────────────────────────────
+  # Open WebUI — chat interface pointing at PCM
+  # ──────────────────────────────────────────────────────────────────────────
+  open-webui:
+    image: ghcr.io/open-webui/open-webui:main
+    container_name: open-webui
+    restart: unless-stopped
+    networks:
+      - pnyx-net-pf
+    ports:
+      - "3000:8080"   # Open WebUI HTTP interface
+    volumes:
+      - open-webui-data:/app/backend/data
+    environment:
+      # Point directly at PCM by Docker service name — no host routing needed.
+      OPENAI_API_BASE_URL: ${OPENAI_API_BASE_URL}
+      OPENAI_API_KEY:      ${OPENAI_API_KEY}
+      ENABLE_PERSISTENT_CONFIG: ${ENABLE_PERSISTENT_CONFIG}
+      ENABLE_FOLLOW_UP_GENERATION: ${ENABLE_FOLLOW_UP_GENERATION}
+      ENABLE_TITLE_GENERATION:     ${ENABLE_TITLE_GENERATION}
+      ENABLE_TAGS_GENERATION:      ${ENABLE_TAGS_GENERATION}
+      HF_TOKEN: ${HF_TOKEN}
+    depends_on:
+      pnyx-pcm:
+        condition: service_healthy
+      pnyx-pipelines:
+        condition: service_healthy
+
+  # ──────────────────────────────────────────────────────────────────────────
+  # Open WebUI Pipelines — custom Pipe that injects X-Session-ID into PCM
+  # ──────────────────────────────────────────────────────────────────────────
+  pnyx-pipelines:
+    image: ghcr.io/open-webui/pipelines:main
+    container_name: pnyx-pipelines
+    restart: unless-stopped
+    # Match host UID/GID so files written in ./pipelines are not root-owned.
+    user: "${UID:-1000}:${GID:-1000}"
+    networks:
+      - pnyx-net-pf
+    ports:
+      - "9099:9099"   # Pipelines API (referenced by Open WebUI connection)
+    volumes:
+      - type: bind
+        source: ./pipelines
+        target: /app/pipelines
+        read_only: false
+    environment:
+      PIPELINES_API_KEY: ${PIPELINES_API_KEY}
+    # Needed if any pipeline valve points at host.docker.internal.
+    extra_hosts:
+      - "host.docker.internal:host-gateway"
+    depends_on:
+      pnyx-pcm:
+        condition: service_healthy
+    healthcheck:
+      test: ["CMD", "curl", "-f", "http://localhost:9099/"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+      start_period: 15s

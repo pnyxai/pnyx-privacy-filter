@@ -1,0 +1,27 @@
+pnyx-privacy-filter
+Copyright 2026 PNYX AI
+
+This product includes software developed by OpenAI, Inc.
+
+--------------------------------------------------------------------------------
+openai/privacy-filter
+Copyright 2026 OpenAI, Inc.
+Licensed under the Apache License, Version 2.0
+https://github.com/openai/privacy-filter
+https://huggingface.co/openai/privacy-filter
+
+The following files are derivative works of openai/privacy-filter:
+
+  model_repository/pnyx-pf/tokenizer_model/1/model.py
+    Based on opf._core.runtime (tokenization and input preparation logic).
+    Modified to run as a Triton Python backend producing input tensors for
+    the downstream ONNX model stage.
+
+  model_repository/pnyx-pf/postprocessing_model/1/model.py
+    Based on opf._core.runtime (predict_text, post-processing logic) and
+    opf._core.spans (label-to-span conversion, character offset decoding).
+    Modified to run as a Triton Python backend receiving batched logits and
+    token IDs from an upstream ONNX model stage.
+
+A copy of the Apache License, Version 2.0 is available at:
+http://www.apache.org/licenses/LICENSE-2.0

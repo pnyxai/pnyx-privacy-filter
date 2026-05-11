@@ -1,0 +1,2 @@
+# Triton ensemble models require a version directory to exist.
+# No model artifacts are needed here; the ensemble is defined entirely in config.pbtxt.
