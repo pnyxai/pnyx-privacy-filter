@@ -18,6 +18,7 @@ Privacy-filtering stack for LLM deployments. PII is detected and redacted before
 
 ## PCM Features:
 - OpenAI-compatible API (currently only `v1/chat/completions`, but to be extended in future)
+- Streaming (`stream: true`) with real-time de-anonymisation of `content`, `reasoning`, and streamed tool-call arguments
 - Session tracking with span maps for accurate de-anonymisation of LLM responses
 - Tool/function response support.
 - PCM maintains the same placeholder map for the entire session, so if a response contains PII that maps to an existing placeholder, the LLM will see the placeholder rather than the raw text. This allows the LLM to refer to previously redacted entities by their placeholders, improving consistency across turns and tools.

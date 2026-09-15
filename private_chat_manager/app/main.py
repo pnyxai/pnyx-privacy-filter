@@ -5,13 +5,17 @@ from typing import Any
 
 import httpx
 import aiosqlite
-from fastapi import Depends, FastAPI, Header, HTTPException, Request
-from fastapi.responses import JSONResponse, Response
+from fastapi import APIRouter, Depends, FastAPI, Header, HTTPException, Request
+from fastapi.responses import JSONResponse, Response, StreamingResponse
 
 from ._logging import configure_logging, get_logger
 from .config import Settings
 from .models import PrivateChatRequest, SessionInspectResponse
-from .privacy_manager import handle_request
+from .privacy_manager import (
+    handle_request,
+    handle_stream_request,
+    prepare_request,
+)
 from .session_store import ensure_schema, get_session
 from .triton_client import TritonPrivacyFilterClient
 
@@ -75,10 +79,8 @@ def create_app(settings: Settings | None = None) -> FastAPI:
         lifespan=lifespan,
     )
     app.state.settings = settings
+    app.include_router(router)
     return app
-
-
-app = create_app()
 
 
 # ---------------------------------------------------------------------------
@@ -96,16 +98,23 @@ def get_triton_client(request: Request) -> TritonPrivacyFilterClient:
 
 # ---------------------------------------------------------------------------
 # Routes
+#
+# Defined on a router so that ``create_app()`` returns a fully routed app and
+# tests can build one with custom settings.  ``create_app`` is invoked at the
+# bottom of this module for ``uvicorn app.main:app``.
 # ---------------------------------------------------------------------------
 
 
-@app.get("/health")
+router = APIRouter()
+
+
+@router.get("/health")
 async def health() -> dict[str, str]:
     """Liveness probe."""
     return {"status": "ok"}
 
 
-@app.get("/health/triton")
+@router.get("/health/triton")
 async def health_triton(
     triton_client: TritonPrivacyFilterClient = Depends(get_triton_client),
 ) -> dict[str, Any]:
@@ -121,7 +130,7 @@ async def health_triton(
     return {"status": "ok", "triton": "ready"}
 
 
-@app.get("/v1/sessions/{session_id}", response_model=SessionInspectResponse)
+@router.get("/v1/sessions/{session_id}", response_model=SessionInspectResponse)
 async def inspect_session(
     session_id: str,
     settings: Settings = Depends(get_settings),
@@ -169,13 +178,13 @@ async def inspect_session(
     )
 
 
-@app.post("/v1/chat/completions")
+@router.post("/v1/chat/completions")
 async def chat_completions(
     request: PrivateChatRequest,
     x_session_id: str | None = Header(default=None, alias="X-Session-ID"),
     settings: Settings = Depends(get_settings),
     triton_client: TritonPrivacyFilterClient = Depends(get_triton_client),
-) -> JSONResponse:
+) -> Response:
     """Privacy-aware /v1/chat/completions endpoint.
 
     Accepts the same body as the OpenAI Chat Completions API with one extra
@@ -186,22 +195,43 @@ async def chat_completions(
       Placeholders from *previous* turns in the session are still
       de-anonymised in the response.
 
-    Streaming (``stream: true``) is **not** supported and returns HTTP 400.
+    Both buffered (``stream=false``) and streaming (``stream=true``) modes are
+    supported.  Streaming returns ``text/event-stream`` SSE frames whose
+    deltas have been de-anonymised in real time; the resolved session ID is
+    always returned in the ``X-Session-ID`` response header.
     """
     logger.info(
         "chat completion request",
         session_id_hint=x_session_id or "new",
         msg_count=len(request.messages),
         bypass=request.bypass_privacy_filter,
+        stream=bool(request.stream),
     )
 
     if request.stream:
-        raise HTTPException(
-            status_code=400,
-            detail=(
-                "Streaming is not supported by PrivateChatManager. "
-                "Set stream=false (or omit the field)."
-            ),
+        async with aiosqlite.connect(settings.db_path) as conn:
+            await conn.execute("PRAGMA journal_mode=WAL")
+            prepared = await prepare_request(
+                request=request,
+                session_id_header=x_session_id,
+                settings=settings,
+                triton_client=triton_client,
+                conn=conn,
+            )
+
+        logger.info(
+            "streaming chat completion started",
+            session_id=prepared.session_id,
+        )
+        return StreamingResponse(
+            handle_stream_request(prepared, settings),
+            media_type="text/event-stream",
+            headers={
+                "X-Session-ID": prepared.session_id,
+                "Cache-Control": "no-cache",
+                "Connection": "keep-alive",
+                "X-Accel-Buffering": "no",
+            },
         )
 
     async with aiosqlite.connect(settings.db_path) as conn:
@@ -235,7 +265,7 @@ _HOP_BY_HOP = frozenset({
 })
 
 
-@app.api_route("/{path:path}", methods=["GET", "POST", "PUT", "PATCH", "DELETE", "OPTIONS", "HEAD"])
+@router.api_route("/{path:path}", methods=["GET", "POST", "PUT", "PATCH", "DELETE", "OPTIONS", "HEAD"])
 async def llm_proxy(
     path: str,
     raw_request: Request,
@@ -297,4 +327,8 @@ async def llm_proxy(
         headers=response_headers,
         media_type=llm_resp.headers.get("content-type"),
     )
+
+
+# Module-level application for ``uvicorn app.main:app``.
+app = create_app()
 

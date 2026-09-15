@@ -1,7 +1,10 @@
+import re
 from typing import Any
 
 from pydantic import field_validator
 from pydantic_settings import BaseSettings, SettingsConfigDict
+
+from .streaming import DEFAULT_PLACEHOLDER_LABELS
 
 # Roles filtered by default when PCM_FILTERABLE_ROLES is not set.
 _DEFAULT_FILTERABLE_ROLES: frozenset[str] = frozenset({"user", "tool", "function"})
@@ -47,6 +50,44 @@ class Settings(BaseSettings):
         if isinstance(v, (list, tuple, set, frozenset)):
             return frozenset(str(r).strip().lower() for r in v if str(r).strip())
         return _DEFAULT_FILTERABLE_ROLES
+
+    # Labels used by the streaming de-anonymiser to recognise placeholder tags.
+    # They must match the labels emitted by the privacy-filter (after the
+    # ``_label_placeholder`` normalisation: uppercase, non-alphanumerics → "_").
+    # The default covers the current openai/privacy-filter v2 taxonomy.
+    placeholder_labels: Any = frozenset(DEFAULT_PLACEHOLDER_LABELS)
+
+    @field_validator("placeholder_labels", mode="before")
+    @classmethod
+    def _parse_placeholder_labels(cls, v: Any) -> frozenset[str]:
+        def _normalize(label: str) -> str:
+            return re.sub(r"[^A-Za-z0-9]+", "_", label.upper()).strip("_")
+
+        if isinstance(v, str):
+            raw_labels: list[str] = v.split(",")
+        elif isinstance(v, (list, tuple, set, frozenset)):
+            raw_labels = [str(raw) for raw in v]
+        else:
+            return frozenset(DEFAULT_PLACEHOLDER_LABELS)
+
+        labels = frozenset(n for n in (_normalize(raw) for raw in raw_labels) if n)
+        return labels if labels else frozenset(DEFAULT_PLACEHOLDER_LABELS)
+
+    # Text appended to the client's system prompt so the downstream LLM knows
+    # how to treat placeholder tags (e.g. "<PRIVATE_PERSON_1>"). Empty disables
+    # the feature. In a .env file, use "\n" for newlines (or a quoted,
+    # multi-line value); literal "\n"/"\t" escapes are converted here.
+    system_prompt_pii_instruction: str = ""
+
+    @field_validator("system_prompt_pii_instruction", mode="before")
+    @classmethod
+    def _parse_system_prompt_pii_instruction(cls, v: Any) -> str:
+        if v is None:
+            return ""
+        text = str(v)
+        if "\\" not in text:
+            return text
+        return text.replace("\\n", "\n").replace("\\t", "\t")
 
     # Comma-separated list of verbose event names to emit at DEBUG level.
     # Default: empty — none of the heavy payloads are logged.

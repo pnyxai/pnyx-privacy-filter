@@ -1,8 +1,12 @@
 from __future__ import annotations
 
+import asyncio
 import copy
+import json
 import time
 import uuid
+from collections.abc import AsyncIterator
+from dataclasses import dataclass, field
 from typing import Any
 
 import aiosqlite
@@ -13,10 +17,10 @@ from ._logging import get_logger
 from .config import Settings
 from .models import PrivacyFilterState, PrivateChatRequest, SessionData
 from .session_store import get_session, save_session
+from .streaming import StreamResponseFilter
 from .triton_client import TritonPrivacyFilterClient
 
 logger = get_logger(__name__)
-
 
 
 # ---------------------------------------------------------------------------
@@ -131,48 +135,95 @@ def _strip_none(d: dict[str, Any]) -> dict[str, Any]:
     return {k: v for k, v in d.items() if v is not None}
 
 
+def append_instruction_to_content(content: Any, instruction: str) -> Any:
+    """Append the configured PII instruction to a message ``content`` value.
+
+    Handles the three OpenAI content shapes without mutating the input:
+
+    * ``None``            → the instruction alone;
+    * ``str``             → ``content`` + blank line + instruction (or just the
+      instruction when the existing content is empty);
+    * ``list`` (multi-part) → a new ``{"type": "text", ...}`` part appended.
+    """
+    if not instruction:
+        return content
+    if content is None:
+        return instruction
+    if isinstance(content, str):
+        return f"{content}\n\n{instruction}" if content else instruction
+    if isinstance(content, list):
+        return [*content, {"type": "text", "text": instruction}]
+    return content
+
+
+def _find_first_system_index(messages: list[dict[str, Any]]) -> int | None:
+    """Return the index of the first ``role == "system"`` message, if any."""
+    for index, message in enumerate(messages):
+        if isinstance(message, dict) and message.get("role") == "system":
+            return index
+    return None
+
+
+def _llm_chat_url(settings: Settings) -> str:
+    return f"{settings.llm_url.rstrip('/')}/v1/chat/completions"
+
+
+def _build_llm_headers(settings: Settings) -> dict[str, str]:
+    headers: dict[str, str] = {"Content-Type": "application/json"}
+    if settings.llm_api_key:
+        headers["Authorization"] = f"Bearer {settings.llm_api_key}"
+    return headers
+
+
 # ---------------------------------------------------------------------------
-# Main request handler
+# Prepared request (shared by streaming and non-streaming paths)
 # ---------------------------------------------------------------------------
 
 
-async def handle_request(
+@dataclass
+class PreparedRequest:
+    """Everything needed to (a) call the LLM and (b) finish the session.
+
+    Produced by :func:`prepare_request` and consumed either by
+    :func:`handle_request` (buffered response) or by
+    :func:`handle_stream_request` (server-sent events).
+    """
+
+    session_id: str
+    session: SessionData
+    placeholder_map: dict[str, str]
+    llm_payload: dict[str, Any]
+    headers: dict[str, str] = field(default_factory=dict)
+
+
+# ---------------------------------------------------------------------------
+# Session / payload preparation
+# ---------------------------------------------------------------------------
+
+
+async def prepare_request(
     request: PrivateChatRequest,
     session_id_header: str | None,
     settings: Settings,
     triton_client: TritonPrivacyFilterClient,
     conn: aiosqlite.Connection,
-) -> tuple[dict[str, Any], str]:
-    """Process one chat-completion request through the privacy mid-layer.
+) -> PreparedRequest:
+    """Load the session, redact new messages and build the LLM payload.
+
+    This is the shared front half of both the buffered and streaming handlers.
+    It performs no LLM I/O and no session write; the caller is responsible for
+    persisting the completed assistant turn.
 
     Workflow
     --------
     1.  Resolve (or generate) a session ID.
     2.  Load or initialise session state from SQLite.
-    3.  Validate that the last message has ``role == "user"``.
-    4.  Pass-through any non-final messages (system prompts, etc.) unchanged.
-    5a. *Normal path*: send the last user message to Triton, apply indexed
-        placeholder substitution, append to hidden_messages.
-    5b. *Bypass path*: skip Triton entirely; append the raw message as-is.
-    6.  Forward *hidden_messages* to the downstream LLM.
-    7.  Deep-copy and de-anonymise the LLM response for the caller.
-    8.  Persist both the placeholder (hidden) and de-anonymised (raw) assistant
-        turn in the session.
-    9.  Save updated session to SQLite and return the response + session ID.
-
-    Args:
-        request:            Validated ``PrivateChatRequest`` from the endpoint.
-        session_id_header:  Value of the ``X-Session-ID`` HTTP request header
-                            (may be None).
-        settings:           Application settings (URLs, keys, …).
-        triton_client:      Initialised ``TritonPrivacyFilterClient``.
-        conn:               Open ``aiosqlite`` connection for this request.
-
-    Returns:
-        ``(response_dict, session_id)`` where *response_dict* is the
-        de-anonymised OpenAI-compatible JSON payload.
+    3.  Validate that the last message is not an assistant turn.
+    4.  Pass-through any non-filterable messages (system prompts, etc.).
+    5.  Send each filterable message to Triton, apply indexed placeholder
+        substitution, append the redacted copy to ``hidden_messages``.
+    6.  Build the downstream LLM payload from the hidden history.
     """
-
     # ------------------------------------------------------------------
     # 1. Resolve session ID: X-Session-ID header > new UUID
     # ------------------------------------------------------------------
@@ -274,12 +325,7 @@ async def handle_request(
     #
     # Which roles are filtered is controlled by settings.filterable_roles
     # (env var PCM_FILTERABLE_ROLES, default: user,tool,function).
-    # Roles absent from that set pass through unchanged:
-    #   - "assistant": always unfiltered — either it was produced by PCM
-    #     (placeholders already in place) or it predates PCM (PII already
-    #     exposed; filtering retroactively does nothing).
-    #   - "system" by default: infrastructure prompts, not user data.
-    #     Add it to PCM_FILTERABLE_ROLES if prompts contain personal data.
+    # Roles absent from that set pass through unchanged.
     #
     # type_counters and placeholder_map accumulate across ALL new messages
     # in this batch so that two tool replies in the same request that
@@ -289,45 +335,60 @@ async def handle_request(
     new_map = dict(session.privacy_state.placeholder_map)
     new_redaction_results: list[dict[str, Any]] = []
 
-    for msg in new_messages:
+    # The configured PII instruction is appended to the *first* client system
+    # message in this batch (persisted once in hidden history).  If the client
+    # sent no system message at all, a synthetic one is added to the forwarded
+    # payload only — inserting it into hidden history would desynchronise the
+    # cursor used to detect new messages on the next turn.
+    instruction = settings.system_prompt_pii_instruction
+    target_system_index = (
+        _find_first_system_index(new_messages) if instruction else None
+    )
+
+    for index, msg in enumerate(new_messages):
         role = msg.get("role", "")
         session.raw_messages.append(msg)
 
         if role not in settings.filterable_roles or request.bypass_privacy_filter:
             # Pass through unchanged (role not in filterable_roles, or bypass active)
-            session.hidden_messages.append(msg)
-            continue
+            hidden_content: Any = msg.get("content")
+        else:
+            # --- Filter this message through Triton ---
+            content = _extract_text_content(msg.get("content"))
+            _t0 = time.monotonic()
+            redaction_result: dict[str, Any] = await triton_client.infer(content)
+            _elapsed_ms = round((time.monotonic() - _t0) * 1000)
 
-        # --- Filter this message through Triton ---
-        content = _extract_text_content(msg.get("content"))
-        _t0 = time.monotonic()
-        redaction_result: dict[str, Any] = await triton_client.infer(content)
-        _elapsed_ms = round((time.monotonic() - _t0) * 1000)
-
-        span_count = len(redaction_result.get("detected_spans", []))
-        logger.info(
-            "message redacted",
-            session_id=session_id,
-            role=role,
-            span_count=span_count,
-            elapsed_ms=_elapsed_ms,
-        )
-        # NOTE: log below may contain PII (original span text).
-        if "redaction_result" in settings.verbose_log_events:
-            logger.debug(
-                "redaction result",
+            span_count = len(redaction_result.get("detected_spans", []))
+            logger.info(
+                "message redacted",
                 session_id=session_id,
-                redaction_result=redaction_result,
+                role=role,
+                span_count=span_count,
+                elapsed_ms=_elapsed_ms,
             )
+            # NOTE: log below may contain PII (original span text).
+            if "redaction_result" in settings.verbose_log_events:
+                logger.debug(
+                    "redaction result",
+                    session_id=session_id,
+                    redaction_result=redaction_result,
+                )
 
-        indexed_text, new_counters, new_map = apply_placeholder_indexing(
-            redaction_result,
-            new_counters,
-            new_map,
-        )
+            hidden_content, new_counters, new_map = apply_placeholder_indexing(
+                redaction_result,
+                new_counters,
+                new_map,
+            )
+            new_redaction_results.append(redaction_result)
 
-        session.hidden_messages.append({**msg, "content": indexed_text})
-        new_redaction_results.append(redaction_result)
+        if index == target_system_index:
+            # Appended *after* redaction so the instruction never reaches Triton.
+            hidden_content = append_instruction_to_content(hidden_content, instruction)
+
+        # Store a copy so hidden history never aliases (and cannot mutate) the
+        # raw history for pass-through roles.
+        session.hidden_messages.append({**msg, "content": hidden_content})
 
     # Commit accumulated privacy state updates
     session.privacy_state = PrivacyFilterState(
@@ -340,28 +401,25 @@ async def handle_request(
     )
 
     # ------------------------------------------------------------------
-    # 6. Forward hidden messages to the downstream LLM
+    # 6. Build the forwarded payload: preserve all original sampling params,
+    #    override model/messages/stream.
     # ------------------------------------------------------------------
-    # Build the forwarded payload: preserve all original sampling params,
-    # override model/messages/stream.
     llm_payload = request.model_dump(
         exclude={"session_id", "bypass_privacy_filter", "messages", "model"},
         exclude_none=True,
     )
     llm_payload["model"] = settings.llm_model_name
     llm_payload["messages"] = session.hidden_messages
-    llm_payload["stream"] = False  # streaming not supported by this mid-layer
+    llm_payload["stream"] = bool(request.stream)
 
-    headers: dict[str, str] = {"Content-Type": "application/json"}
-    if settings.llm_api_key:
-        headers["Authorization"] = f"Bearer {settings.llm_api_key}"
+    # No client system message anywhere in the session: inject a synthetic one
+    # into the payload only (never persisted, to keep the cursor aligned).
+    if instruction and _find_first_system_index(session.hidden_messages) is None:
+        llm_payload["messages"] = [
+            {"role": "system", "content": instruction},
+            *session.hidden_messages,
+        ]
 
-    logger.info(
-        "forwarding to LLM",
-        session_id=session_id,
-        model=settings.llm_model_name,
-        hidden_msg_count=len(session.hidden_messages),
-    )
     if "llm_payload" in settings.verbose_log_events:
         logger.debug(
             "LLM payload",  # hidden messages are already redacted — no PII
@@ -369,12 +427,60 @@ async def handle_request(
             payload=llm_payload,
         )
 
+    return PreparedRequest(
+        session_id=session_id,
+        session=session,
+        placeholder_map=new_map,
+        llm_payload=llm_payload,
+        headers=_build_llm_headers(settings),
+    )
+
+
+# ---------------------------------------------------------------------------
+# Buffered (non-streaming) handler
+# ---------------------------------------------------------------------------
+
+
+async def handle_request(
+    request: PrivateChatRequest,
+    session_id_header: str | None,
+    settings: Settings,
+    triton_client: TritonPrivacyFilterClient,
+    conn: aiosqlite.Connection,
+) -> tuple[dict[str, Any], str]:
+    """Process one buffered chat-completion request through the privacy layer.
+
+    Returns ``(response_dict, session_id)`` where *response_dict* is the
+    de-anonymised OpenAI-compatible JSON payload.
+    """
+
+    prepared = await prepare_request(
+        request=request,
+        session_id_header=session_id_header,
+        settings=settings,
+        triton_client=triton_client,
+        conn=conn,
+    )
+    session = prepared.session
+    session_id = prepared.session_id
+    placeholder_map = prepared.placeholder_map
+
+    # ------------------------------------------------------------------
+    # Forward hidden messages to the downstream LLM
+    # ------------------------------------------------------------------
+    logger.info(
+        "forwarding to LLM",
+        session_id=session_id,
+        model=settings.llm_model_name,
+        hidden_msg_count=len(session.hidden_messages),
+    )
+
     _t0 = time.monotonic()
     async with httpx.AsyncClient(timeout=120.0) as http_client:
         llm_resp = await http_client.post(
-            f"{settings.llm_url.rstrip('/')}/v1/chat/completions",
-            json=llm_payload,
-            headers=headers,
+            _llm_chat_url(settings),
+            json=prepared.llm_payload,
+            headers=prepared.headers,
         )
         llm_resp.raise_for_status()
     _llm_elapsed_ms = round((time.monotonic() - _t0) * 1000)
@@ -398,29 +504,17 @@ async def handle_request(
         logger.debug("LLM raw response body", session_id=session_id, response=llm_data)
 
     # ------------------------------------------------------------------
-    # 7. De-anonymise the LLM response for the caller.
+    # De-anonymise the LLM response for the caller.
     #    We work on a deep copy so that llm_data retains the original
     #    (placeholder) version for the session's hidden history.
     # ------------------------------------------------------------------
-    placeholder_map = session.privacy_state.placeholder_map
     response_data: dict[str, Any] = copy.deepcopy(llm_data)
-
     for choice in response_data.get("choices", []):
         msg = choice.get("message", {})
-        if msg.get("content"):
-            msg["content"] = deanonymize_text(msg["content"], placeholder_map)
-        # Tool calls
-        for tc in msg.get("tool_calls") or []:
-            fn = tc.get("function", {})
-            if fn.get("arguments"):
-                fn["arguments"] = deanonymize_text(fn["arguments"], placeholder_map)
-        # Function calls (legacy role)
-        for tc in msg.get("function_calls") or []:
-            if tc.get("arguments"):
-                tc["arguments"] = deanonymize_text(tc["arguments"], placeholder_map)
+        _deanonymize_message(msg, placeholder_map)
 
     # ------------------------------------------------------------------
-    # 8. Persist the assistant turn in both session histories.
+    # Persist the assistant turn in both session histories.
     #    hidden  → the raw LLM output (still contains placeholders)
     #    raw     → the de-anonymised version shown to the caller
     # ------------------------------------------------------------------
@@ -434,7 +528,6 @@ async def handle_request(
                     "role": orig_msg.get("role", "assistant"),
                     "content": orig_msg.get("content"),
                     "tool_calls": orig_msg.get("tool_calls") or None,
-                    "function_calls": orig_msg.get("function_calls") or None,
                 }
             )
         )
@@ -449,7 +542,7 @@ async def handle_request(
         )
 
     # ------------------------------------------------------------------
-    # 9. Save session and return
+    # Save session and return
     # ------------------------------------------------------------------
     session.updated_at = time.time()
     await save_session(conn, session)
@@ -469,3 +562,316 @@ async def handle_request(
         )
 
     return response_data, session_id
+
+
+def _deanonymize_message(msg: dict[str, Any], placeholder_map: dict[str, str]) -> None:
+    """Substitute placeholders back into every text field of *msg* in place.
+
+    Covers ``content``, the reasoning side channel (``reasoning`` /
+    ``reasoning_content``), tool calls and — defensively — the legacy
+    ``function_calls`` list.  The legacy list is **not** persisted to the
+    session history (see ``handle_request``); it is only de-anonymised here so
+    an exotic backend cannot leak raw placeholders to the client.
+    """
+    if msg.get("content"):
+        msg["content"] = deanonymize_text(msg["content"], placeholder_map)
+    for key in ("reasoning", "reasoning_content"):
+        if msg.get(key):
+            msg[key] = deanonymize_text(msg[key], placeholder_map)
+    # Tool calls
+    for tc in msg.get("tool_calls") or []:
+        fn = tc.get("function", {})
+        if fn.get("arguments"):
+            fn["arguments"] = deanonymize_text(fn["arguments"], placeholder_map)
+    # Function calls (legacy role)
+    for tc in msg.get("function_calls") or []:
+        if tc.get("arguments"):
+            tc["arguments"] = deanonymize_text(tc["arguments"], placeholder_map)
+
+
+# ---------------------------------------------------------------------------
+# Streaming (Server-Sent Events) handler
+# ---------------------------------------------------------------------------
+
+
+def _sse(payload: dict[str, Any]) -> str:
+    """Serialize a chunk object as one SSE ``data:`` event."""
+    return "data: " + json.dumps(payload, ensure_ascii=False, separators=(",", ":")) + "\n\n"
+
+
+def _sse_error(message: str) -> str:
+    """Emit an OpenAI-style streaming error event, then terminators.
+
+    The raw upstream body is intentionally not forwarded — it can contain
+    internal details.  Only a coarse, safe message is sent to the client.
+    """
+    error_chunk = {
+        "error": {
+            "message": message,
+            "type": "upstream_error",
+            "code": "stream_error",
+        }
+    }
+    return _sse(error_chunk) + "data: [DONE]\n\n"
+
+
+def _residual_events(
+    meta: dict[str, Any],
+    residuals: dict[int, dict[str, str]],
+) -> list[str]:
+    """Build chunks for text drained from partial tags at end of stream."""
+    events: list[str] = []
+    for index, fields in residuals.items():
+        delta: dict[str, str] = {}
+        for key in ("content", "reasoning", "reasoning_content"):
+            if fields.get(key):
+                delta[key] = fields[key]
+        if not delta:
+            continue
+        events.append(
+            _sse(
+                {
+                    "id": meta.get("id", ""),
+                    "object": "chat.completion.chunk",
+                    "created": meta.get("created", int(time.time())),
+                    "model": meta.get("model", ""),
+                    "choices": [
+                        {
+                            "index": index,
+                            "delta": delta,
+                            "logprobs": None,
+                            "finish_reason": None,
+                        }
+                    ],
+                }
+            )
+        )
+    return events
+
+
+async def _persist_stream_session(
+    session: SessionData,
+    stream_filter: StreamResponseFilter,
+    session_id: str,
+    settings: Settings,
+) -> None:
+    """Append the streamed assistant turn to both histories and save."""
+    hidden_msg, raw_msg = stream_filter.assistant_history(0)
+    hidden_msg = _strip_none(hidden_msg)
+    raw_msg = _strip_none(raw_msg)
+
+    has_output = (
+        hidden_msg.get("content") is not None
+        or hidden_msg.get("tool_calls")
+        or raw_msg.get("content") is not None
+    )
+    if not has_output:
+        logger.warning("stream produced no assistant output; not persisting turn",
+                       session_id=session_id)
+        return
+
+    session.hidden_messages.append(hidden_msg)
+    session.raw_messages.append(raw_msg)
+    session.updated_at = time.time()
+
+    async with aiosqlite.connect(settings.db_path) as conn:
+        await conn.execute("PRAGMA journal_mode=WAL")
+        await save_session(conn, session)
+
+    logger.info(
+        "stream session saved",
+        session_id=session_id,
+        raw_msg_count=len(session.raw_messages),
+        hidden_msg_count=len(session.hidden_messages),
+    )
+    if "session_state" in settings.verbose_log_events:
+        logger.debug(
+            "stream session state",
+            session_id=session_id,
+            raw_messages=session.raw_messages,
+            hidden_messages=session.hidden_messages,
+            privacy_state=session.privacy_state.model_dump(),
+        )
+
+
+async def handle_stream_request(
+    prepared: PreparedRequest,
+    settings: Settings,
+) -> AsyncIterator[str]:
+    """Forward to the LLM with ``stream=true`` and de-anonymise deltas live.
+
+    Yields raw SSE frames (``data: {json}\\n\\n``) suitable for a FastAPI
+    :class:`~fastapi.responses.StreamingResponse`.  The assistant turn is
+    persisted to the session when the stream terminates (normally, on error,
+    or on client disconnect) so the next turn sees a coherent history.
+
+    De-anonymisation is incremental: see :mod:`app.streaming` for the exact
+    detection/replacement algorithm.
+    """
+    session = prepared.session
+    session_id = prepared.session_id
+    stream_filter = StreamResponseFilter(
+        prepared.placeholder_map,
+        settings.placeholder_labels,
+    )
+
+    logger.info(
+        "forwarding streaming request to LLM",
+        session_id=session_id,
+        model=settings.llm_model_name,
+        hidden_msg_count=len(session.hidden_messages),
+    )
+
+    # Metadata copied from the last received chunk so residual events can be
+    # shaped like normal assistant chunks.
+    meta: dict[str, Any] = {}
+    finalized = False
+
+    def _finalize() -> dict[int, dict[str, str]]:
+        nonlocal finalized
+        if finalized:
+            return {}
+        finalized = True
+        residuals: dict[int, dict[str, str]] = {}
+        for index in stream_filter.choice_indices():
+            drained = stream_filter.flush_choice(index)
+            if drained:
+                residuals[index] = drained
+        return residuals
+
+    _t0 = time.monotonic()
+    seen_usage = False
+    finished = False
+
+    async def _finish() -> None:
+        """Flush, log and persist the streamed turn exactly once.
+
+        Persisting *before* the terminal ``[DONE]`` frame guarantees the
+        session is available to the very next request, and shields the write
+        from a client that disconnects the instant it sees ``[DONE]``.
+        """
+        nonlocal finished
+        if finished:
+            return
+        finished = True
+
+        elapsed_ms = round((time.monotonic() - _t0) * 1000)
+        _finalize()
+
+        # Mirror the buffered path's ``llm_raw_response`` / ``response_body``
+        # debug events using the fully assembled (post-flush) stream.
+        if settings.verbose_log_events & {"llm_raw_response", "response_body"}:
+            for choice_index in stream_filter.choice_indices():
+                client_msg = stream_filter.client_message(choice_index)
+                has_output = (
+                    client_msg.get("content") is not None
+                    or client_msg.get("reasoning")
+                    or client_msg.get("tool_calls")
+                )
+                if not has_output:
+                    continue
+                if "llm_raw_response" in settings.verbose_log_events:
+                    logger.debug(
+                        "stream raw response",  # placeholders only — no PII
+                        session_id=session_id,
+                        choice_index=choice_index,
+                        message=stream_filter.raw_message(choice_index),
+                    )
+                if "response_body" in settings.verbose_log_events:
+                    logger.debug(
+                        "stream response body",  # ⚠ de-anonymised — contains PII
+                        session_id=session_id,
+                        choice_index=choice_index,
+                        message=client_msg,
+                    )
+
+        try:
+            await _persist_stream_session(session, stream_filter, session_id, settings)
+        except Exception:
+            logger.exception("failed to persist streamed session", session_id=session_id)
+        logger.info(
+            "stream finished",
+            session_id=session_id,
+            elapsed_ms=elapsed_ms,
+            usage_seen=seen_usage,
+        )
+
+    try:
+        # ``read=None`` disables the read timeout for long-lived streams.
+        timeout = httpx.Timeout(connect=10.0, read=None, write=30.0, pool=10.0)
+        async with httpx.AsyncClient(timeout=timeout) as http_client:
+            async with http_client.stream(
+                "POST",
+                _llm_chat_url(settings),
+                json=prepared.llm_payload,
+                headers=prepared.headers,
+            ) as llm_resp:
+                llm_resp.raise_for_status()
+
+                async for line in llm_resp.aiter_lines():
+                    if line.startswith("data:"):
+                        payload = line[len("data:"):].strip()
+                        if payload == "[DONE]":
+                            break
+                        if not payload:
+                            continue
+                        try:
+                            chunk = json.loads(payload)
+                        except json.JSONDecodeError:
+                            logger.warning(
+                                "malformed streaming chunk skipped",
+                                session_id=session_id,
+                                raw=payload[:200],
+                            )
+                            continue
+
+                        if chunk.get("id") or chunk.get("model"):
+                            meta = {
+                                "id": chunk.get("id", meta.get("id", "")),
+                                "model": chunk.get("model", meta.get("model", "")),
+                                "created": chunk.get("created", meta.get("created", int(time.time()))),
+                            }
+                        if chunk.get("usage"):
+                            seen_usage = True
+
+                        stream_filter.process_chunk(chunk)
+                        yield _sse(chunk)
+                    elif not line.strip():
+                        # SSE event separator: nothing to forward.
+                        continue
+                    else:
+                        # Preserve any non-data SSE field (comments, event lines).
+                        yield line + "\n\n"
+
+        for event in _residual_events(meta, _finalize()):
+            yield event
+        # Commit the session before signalling completion so a follow-up
+        # request (or a client that disconnects on [DONE]) sees a coherent
+        # history.  ``shield`` keeps the write alive under cancellation.
+        await asyncio.shield(_finish())
+        yield "data: [DONE]\n\n"
+
+    except httpx.HTTPStatusError as exc:
+        logger.error(
+            "upstream LLM rejected streaming request",
+            session_id=session_id,
+            status_code=exc.response.status_code,
+        )
+        yield _sse_error(f"Upstream LLM returned HTTP {exc.response.status_code}")
+    except httpx.HTTPError as exc:
+        logger.error(
+            "upstream LLM streaming transport error",
+            session_id=session_id,
+            error=str(exc),
+        )
+        yield _sse_error("Upstream LLM streaming transport error")
+    except Exception:
+        logger.exception("unexpected error during streaming", session_id=session_id)
+        yield _sse_error("Internal error during streaming")
+    finally:
+        # Best-effort fallback for the error / client-disconnect paths.  The
+        # shield ensures a disconnect cannot cancel the DB write mid-flight.
+        try:
+            await asyncio.shield(_finish())
+        except BaseException:
+            pass

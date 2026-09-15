@@ -89,6 +89,12 @@ services:
       # Comma-separated roles sent through the Triton privacy filter.
       # Default: user,tool,function — add "system" to also redact system prompts.
       PCM_FILTERABLE_ROLES: ${PCM_FILTERABLE_ROLES}
+      # Comma-separated labels the streaming de-anonymiser recognises.
+      # Defaults to the openai/privacy-filter v2 taxonomy when unset.
+      PCM_PLACEHOLDER_LABELS: ${PCM_PLACEHOLDER_LABELS}
+      # Optional text appended to the system prompt explaining placeholder tags.
+      # Empty/unset disables injection.
+      PCM_SYSTEM_PROMPT_PII_INSTRUCTION: ${PCM_SYSTEM_PROMPT_PII_INSTRUCTION}
     # Allows the container to reach services bound on the host
     # Set PCM_LLM_URL=http://host.docker.internal:<port> in your .env.
     extra_hosts:

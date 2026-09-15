@@ -35,6 +35,16 @@ All variables use the `PCM_` prefix.
 | `PCM_DB_PATH` | no | `./sessions.db` | Path inside the container for the SQLite session database |
 | `PCM_HOST` | no | `0.0.0.0` | Bind address for the uvicorn server |
 | `PCM_PORT` | no | `8080` | Bind port for the uvicorn server |
+| `PCM_LOG_LEVEL` | no | `INFO` | Log verbosity: `DEBUG` \| `INFO` \| `WARNING` \| `ERROR` |
+| `PCM_FILTERABLE_ROLES` | no | `user,tool,function` | Comma-separated message roles sent through Triton |
+| `PCM_VERBOSE_LOG_EVENTS` | no | `""` | Comma-separated debug event names (see the PCM README) |
+| `PCM_PLACEHOLDER_LABELS` | no | the 8 privacy-filter labels | Comma-separated labels the streaming de-anonymiser recognises as placeholder tags |
+| `PCM_SYSTEM_PROMPT_PII_INSTRUCTION` | no | `""` | Text appended to the system prompt explaining how to handle placeholder tags |
+
+`PCM_PLACEHOLDER_LABELS` only affects `stream: true` responses. It defaults to
+the `openai/privacy-filter` v2 taxonomy (`ACCOUNT_NUMBER`, `PRIVATE_ADDRESS`,
+`PRIVATE_DATE`, `PRIVATE_EMAIL`, `PRIVATE_PERSON`, `PRIVATE_PHONE`,
+`PRIVATE_URL`, `SECRET`); override it if the upstream model's labels change.
 
 ## Run
 
@@ -87,10 +97,16 @@ docker run -d \
 
 | Method | Path | Description |
 |---|---|---|
-| `POST` | `/v1/chat/completions` | Privacy-aware chat completions (OpenAI-compatible + `session_id` / `bypass_privacy_filter` fields) |
+| `POST` | `/v1/chat/completions` | Privacy-aware chat completions (OpenAI-compatible + `bypass_privacy_filter` field and `X-Session-ID` header) |
 | `GET` | `/v1/sessions/{session_id}` | Inspect raw messages, hidden messages, and privacy state for a session |
 | `GET` | `/health` | Liveness probe |
 | `GET` | `/health/triton` | Readiness probe — checks that the Triton model is ready |
+
+Both buffered (`stream: false`) and streaming (`stream: true`) responses are
+supported. Streaming returns `text/event-stream` SSE frames whose
+`content`/`reasoning`/tool-call deltas are de-anonymised in real time. The
+resolved session ID is returned in the `X-Session-ID` response header; send it
+back on the next request to continue the same session.
 
 ## Quick test
 
@@ -100,6 +116,16 @@ curl http://localhost:8080/health
 curl http://localhost:8080/v1/chat/completions \
   -H "Content-Type: application/json" \
   -d '{
+    "messages": [
+      {"role": "user", "content": "My name is Alice Smith and my email is alice@example.com. Summarise this."}
+    ]
+  }'
+
+# Streaming
+curl -N http://localhost:8080/v1/chat/completions \
+  -H "Content-Type: application/json" \
+  -d '{
+    "stream": true,
     "messages": [
       {"role": "user", "content": "My name is Alice Smith and my email is alice@example.com. Summarise this."}
     ]
