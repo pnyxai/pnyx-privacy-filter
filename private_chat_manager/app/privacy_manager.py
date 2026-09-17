@@ -2,10 +2,11 @@ from __future__ import annotations
 
 import asyncio
 import copy
+import hashlib
 import json
 import time
 import uuid
-from collections.abc import AsyncIterator
+from collections.abc import AsyncIterator, Mapping
 from dataclasses import dataclass, field
 from typing import Any
 
@@ -15,6 +16,11 @@ from fastapi import HTTPException
 
 from ._logging import get_logger
 from .config import Settings
+from .headers import (
+    build_forward_headers,
+    default_session_header_for,
+    redact_headers,
+)
 from .models import PrivacyFilterState, PrivateChatRequest, SessionData
 from .session_store import get_session, save_session
 from .streaming import StreamResponseFilter
@@ -168,11 +174,77 @@ def _llm_chat_url(settings: Settings) -> str:
     return f"{settings.llm_url.rstrip('/')}/v1/chat/completions"
 
 
-def _build_llm_headers(settings: Settings) -> dict[str, str]:
-    headers: dict[str, str] = {"Content-Type": "application/json"}
-    if settings.llm_api_key:
-        headers["Authorization"] = f"Bearer {settings.llm_api_key}"
-    return headers
+def _upstream_error_detail(response: httpx.Response) -> Any:
+    """Best-effort extraction of the upstream error body for the client."""
+    try:
+        return response.json()
+    except ValueError:
+        text = response.text
+        return text[:2000] if text else "Upstream LLM error"
+
+
+def _conversation_fingerprint(messages: list[dict[str, Any]]) -> str:
+    """Return a short, stable hash identifying a logical conversation.
+
+    Derived from the first user message (falling back to the first non-empty
+    message).  An agent's title/side-channel request and its main chat have
+    different first user messages, so they map to separate sessions instead of
+    sharing — and corrupting — one history cursor.
+    """
+    for role in ("user",):
+        for msg in messages:
+            if msg.get("role") == role:
+                content = _extract_text_content(msg.get("content"))
+                if content.strip():
+                    return hashlib.sha1(content.encode("utf-8")).hexdigest()[:12]
+    for msg in messages:
+        content = _extract_text_content(msg.get("content"))
+        if content.strip():
+            return hashlib.sha1(content.encode("utf-8")).hexdigest()[:12]
+    return "0"
+
+
+def resolve_session_key(
+    base_id: str | None, messages: list[dict[str, Any]]
+) -> str:
+    """Resolve the internal session key for a request.
+
+    When the client supplies a session id (from any ``x…session…`` header) it
+    is namespaced by a conversation fingerprint.  When it supplies none — e.g.
+    the Hermes agent with a custom endpoint — the fingerprint itself becomes
+    the key, so turns of one conversation still accumulate history instead of
+    each getting a random id.
+
+    The message list sent to the LLM is unaffected.  A value already containing
+    the ``::`` separator is assumed to be a previously-resolved key and
+    returned unchanged, so clients that echo the ``X-Session-ID`` response
+    header remain stable.
+    """
+    fingerprint = _conversation_fingerprint(messages)
+    if not base_id:
+        return f"auto-{fingerprint}"
+    if "::" in base_id:
+        return base_id
+    return f"{base_id}::{fingerprint}"
+
+
+def _resolve_model(request: PrivateChatRequest, settings: Settings) -> str:
+    """Return the model to forward upstream (client value wins).
+
+    The client-supplied model is authoritative so the agent can pick any model
+    the upstream exposes.  ``PCM_LLM_MODEL_NAME`` is only an optional fallback
+    for clients that omit it.
+    """
+    model = (request.model or "").strip() or (settings.llm_model_name or "").strip()
+    if not model:
+        raise HTTPException(
+            status_code=422,
+            detail=(
+                "No model specified: send a 'model' field or set "
+                "PCM_LLM_MODEL_NAME as a fallback."
+            ),
+        )
+    return model
 
 
 # ---------------------------------------------------------------------------
@@ -207,6 +279,7 @@ async def prepare_request(
     settings: Settings,
     triton_client: TritonPrivacyFilterClient,
     conn: aiosqlite.Connection,
+    client_headers: Mapping[str, str] | None = None,
 ) -> PreparedRequest:
     """Load the session, redact new messages and build the LLM payload.
 
@@ -356,7 +429,22 @@ async def prepare_request(
             # --- Filter this message through Triton ---
             content = _extract_text_content(msg.get("content"))
             _t0 = time.monotonic()
-            redaction_result: dict[str, Any] = await triton_client.infer(content)
+            try:
+                redaction_result: dict[str, Any] = await triton_client.infer(content)
+            except Exception as exc:
+                logger.exception(
+                    "privacy filter inference failed",
+                    session_id=session_id,
+                    role=role,
+                    char_count=len(content),
+                )
+                raise HTTPException(
+                    status_code=502,
+                    detail=(
+                        "Privacy filter (Triton) failed to process the message; "
+                        "the request was not forwarded to the LLM."
+                    ),
+                ) from exc
             _elapsed_ms = round((time.monotonic() - _t0) * 1000)
 
             span_count = len(redaction_result.get("detected_spans", []))
@@ -402,13 +490,15 @@ async def prepare_request(
 
     # ------------------------------------------------------------------
     # 6. Build the forwarded payload: preserve all original sampling params,
-    #    override model/messages/stream.
+    #    use the client's model (falling back to PCM_LLM_MODEL_NAME), and
+    #    replace messages with the hidden (redacted) history.
     # ------------------------------------------------------------------
+    model = _resolve_model(request, settings)
     llm_payload = request.model_dump(
         exclude={"session_id", "bypass_privacy_filter", "messages", "model"},
         exclude_none=True,
     )
-    llm_payload["model"] = settings.llm_model_name
+    llm_payload["model"] = model
     llm_payload["messages"] = session.hidden_messages
     llm_payload["stream"] = bool(request.stream)
 
@@ -420,11 +510,24 @@ async def prepare_request(
             *session.hidden_messages,
         ]
 
+    # Default the upstream session header to the one an OpenCode relay
+    # requires when the operator has not set one explicitly.
+    session_header = settings.llm_session_header or default_session_header_for(
+        settings.llm_url
+    )
+    forward_headers = build_forward_headers(
+        client_headers,
+        api_key=settings.llm_api_key,
+        session_header=session_header,
+        session_id=session_id,
+    )
+
     if "llm_payload" in settings.verbose_log_events:
         logger.debug(
             "LLM payload",  # hidden messages are already redacted — no PII
             session_id=session_id,
             payload=llm_payload,
+            headers=redact_headers(forward_headers),
         )
 
     return PreparedRequest(
@@ -432,7 +535,7 @@ async def prepare_request(
         session=session,
         placeholder_map=new_map,
         llm_payload=llm_payload,
-        headers=_build_llm_headers(settings),
+        headers=forward_headers,
     )
 
 
@@ -447,6 +550,7 @@ async def handle_request(
     settings: Settings,
     triton_client: TritonPrivacyFilterClient,
     conn: aiosqlite.Connection,
+    client_headers: Mapping[str, str] | None = None,
 ) -> tuple[dict[str, Any], str]:
     """Process one buffered chat-completion request through the privacy layer.
 
@@ -460,6 +564,7 @@ async def handle_request(
         settings=settings,
         triton_client=triton_client,
         conn=conn,
+        client_headers=client_headers,
     )
     session = prepared.session
     session_id = prepared.session_id
@@ -471,18 +576,39 @@ async def handle_request(
     logger.info(
         "forwarding to LLM",
         session_id=session_id,
-        model=settings.llm_model_name,
+        model=prepared.llm_payload.get("model"),
         hidden_msg_count=len(session.hidden_messages),
     )
 
     _t0 = time.monotonic()
     async with httpx.AsyncClient(timeout=120.0) as http_client:
-        llm_resp = await http_client.post(
-            _llm_chat_url(settings),
-            json=prepared.llm_payload,
-            headers=prepared.headers,
-        )
-        llm_resp.raise_for_status()
+        try:
+            llm_resp = await http_client.post(
+                _llm_chat_url(settings),
+                json=prepared.llm_payload,
+                headers=prepared.headers,
+            )
+            llm_resp.raise_for_status()
+        except httpx.HTTPStatusError as exc:
+            logger.error(
+                "upstream LLM rejected the request",
+                session_id=session_id,
+                status_code=exc.response.status_code,
+            )
+            raise HTTPException(
+                status_code=exc.response.status_code,
+                detail=_upstream_error_detail(exc.response),
+            ) from exc
+        except httpx.HTTPError as exc:
+            logger.error(
+                "upstream LLM transport error",
+                session_id=session_id,
+                error=str(exc),
+            )
+            raise HTTPException(
+                status_code=502,
+                detail="Upstream LLM transport error",
+            ) from exc
     _llm_elapsed_ms = round((time.monotonic() - _t0) * 1000)
 
     llm_data: dict[str, Any] = llm_resp.json()
@@ -718,7 +844,7 @@ async def handle_stream_request(
     logger.info(
         "forwarding streaming request to LLM",
         session_id=session_id,
-        model=settings.llm_model_name,
+        model=prepared.llm_payload.get("model"),
         hidden_msg_count=len(session.hidden_messages),
     )
 

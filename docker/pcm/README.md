@@ -27,11 +27,13 @@ All variables use the `PCM_` prefix.
 
 | Variable | Required | Default | Description |
 |---|---|---|---|
-| `PCM_LLM_URL` | **yes** | — | Base URL of the downstream LLM, e.g. `http://vllm:8000` |
-| `PCM_LLM_MODEL_NAME` | **yes** | — | Model name forwarded in every LLM request, e.g. `meta-llama/Llama-3-8B-Instruct` |
+| `PCM_LLM_URL` | **yes** | — | Base URL of the downstream LLM, e.g. `http://vllm:8000`. PCM appends `/v1/…` itself; a trailing `/v1` is stripped automatically |
+| `PCM_LLM_MODEL_NAME` | no | `""` | Fallback model used only when the client omits `model`, e.g. `meta-llama/Llama-3-8B-Instruct`. The client-supplied model always wins |
 | `PCM_LLM_API_KEY` | no | `""` | Bearer token for the LLM endpoint (leave empty if not required) |
+| `PCM_LLM_SESSION_HEADER` | no | auto | Upstream session header. Auto-defaults to `x-opencode-session` when `PCM_LLM_URL` host is `opencode.ai`; set explicitly for others |
 | `PCM_TRITON_URL` | no | `localhost:8000` | Host and port of the Triton inference server |
 | `PCM_TRITON_MODEL_NAME` | no | `ensemble_model` | Triton model name to call for privacy filtering |
+| `PCM_TRITON_MAX_CHARS` | no | `8000` | Max characters per Triton call; longer messages are split at natural boundaries and redacted chunk by chunk |
 | `PCM_DB_PATH` | no | `./sessions.db` | Path inside the container for the SQLite session database |
 | `PCM_HOST` | no | `0.0.0.0` | Bind address for the uvicorn server |
 | `PCM_PORT` | no | `8080` | Bind port for the uvicorn server |
@@ -54,7 +56,7 @@ See `examples/` at the repository root for a ready-to-use `docker-compose.yaml`:
 
 ```bash
 cd examples/
-cp sample.env .env   # fill in TRITON_MODELS_PATH, PCM_LLM_URL, PCM_LLM_MODEL_NAME …
+cp sample.env .env   # fill in TRITON_MODELS_PATH, PCM_LLM_URL … (PCM_LLM_MODEL_NAME is optional)
 docker compose up -d
 ```
 

@@ -5,18 +5,25 @@ from typing import Any
 
 import httpx
 import aiosqlite
-from fastapi import APIRouter, Depends, FastAPI, Header, HTTPException, Request
+from fastapi import APIRouter, Depends, FastAPI, HTTPException, Request
 from fastapi.responses import JSONResponse, Response, StreamingResponse
 
 from ._logging import configure_logging, get_logger
 from .config import Settings
+from .headers import (
+    build_forward_headers,
+    build_response_headers,
+    resolve_session_label,
+)
 from .models import PrivateChatRequest, SessionInspectResponse
 from .privacy_manager import (
     handle_request,
     handle_stream_request,
     prepare_request,
+    resolve_session_key,
 )
-from .session_store import ensure_schema, get_session
+from .session_lock import get_session_lock
+from .session_store import ensure_schema, find_sessions_by_base, get_session
 from .triton_client import TritonPrivacyFilterClient
 
 logger = get_logger(__name__)
@@ -39,12 +46,14 @@ async def lifespan(app: FastAPI):
     triton_client = TritonPrivacyFilterClient(
         url=settings.triton_url,
         model_name=settings.triton_model_name,
+        max_chars=settings.triton_max_chars,
     )
     app.state.triton_client = triton_client
     logger.info(
         "Triton client configured",
         triton_url=settings.triton_url,
         triton_model=settings.triton_model_name,
+        triton_max_chars=settings.triton_max_chars,
     )
 
     yield
@@ -148,6 +157,13 @@ async def inspect_session(
     async with aiosqlite.connect(settings.db_path) as conn:
         await conn.execute("PRAGMA journal_mode=WAL")
         session = await get_session(conn, session_id)
+        if session is None:
+            # Internal keys are "<client-id>::<fingerprint>"; resolve a
+            # client-facing id to its conversation(s) and pick the main one.
+            candidates = await find_sessions_by_base(conn, session_id)
+            if candidates:
+                # Prefer the most recently active conversation.
+                session = max(candidates, key=lambda s: s.updated_at)
 
     if session is None:
         logger.debug("session not found", session_id=session_id)
@@ -181,7 +197,7 @@ async def inspect_session(
 @router.post("/v1/chat/completions")
 async def chat_completions(
     request: PrivateChatRequest,
-    x_session_id: str | None = Header(default=None, alias="X-Session-ID"),
+    raw_request: Request,
     settings: Settings = Depends(get_settings),
     triton_client: TritonPrivacyFilterClient = Depends(get_triton_client),
 ) -> Response:
@@ -195,36 +211,69 @@ async def chat_completions(
       Placeholders from *previous* turns in the session are still
       de-anonymised in the response.
 
+    The session is identified by any client header matching ``x…session…``
+    (e.g. ``X-Session-ID``, ``x-opencode-session``, ``x-session-affinity``,
+    ``X-Hermes-Session-Id``), falling back to a new UUID.  The id is then
+    namespaced per conversation (see :func:`resolve_session_key`) so that
+    distinct logical conversations sharing one client session id — such as an
+    agent's title generator and its main chat — do not corrupt each other.
+    Requests for one conversation are serialised.  All client headers (minus
+    hop-by-hop/technical ones) are forwarded to the downstream LLM, and the
+    resolved session id can additionally be re-emitted under
+    ``PCM_LLM_SESSION_HEADER`` for gateways that require it.
+
     Both buffered (``stream=false``) and streaming (``stream=true``) modes are
     supported.  Streaming returns ``text/event-stream`` SSE frames whose
     deltas have been de-anonymised in real time; the resolved session ID is
     always returned in the ``X-Session-ID`` response header.
     """
+    base_session_id = resolve_session_label(raw_request.headers)
+    client_headers = raw_request.headers
+    session_key = resolve_session_key(base_session_id, request.messages)
+
     logger.info(
         "chat completion request",
-        session_id_hint=x_session_id or "new",
+        session_id_hint=base_session_id or "new",
+        session_key=session_key,
         msg_count=len(request.messages),
         bypass=request.bypass_privacy_filter,
         stream=bool(request.stream),
     )
 
+    lock = get_session_lock(session_key)
+
     if request.stream:
-        async with aiosqlite.connect(settings.db_path) as conn:
-            await conn.execute("PRAGMA journal_mode=WAL")
-            prepared = await prepare_request(
-                request=request,
-                session_id_header=x_session_id,
-                settings=settings,
-                triton_client=triton_client,
-                conn=conn,
-            )
+        # Hold the lock across the whole stream: the session is persisted when
+        # the generator finishes, not when prepare_request returns.
+        await lock.acquire()
+        try:
+            async with aiosqlite.connect(settings.db_path) as conn:
+                await conn.execute("PRAGMA journal_mode=WAL")
+                prepared = await prepare_request(
+                    request=request,
+                    session_id_header=session_key,
+                    settings=settings,
+                    triton_client=triton_client,
+                    conn=conn,
+                    client_headers=client_headers,
+                )
+        except BaseException:
+            lock.release()
+            raise
+
+        async def _locked_stream():
+            try:
+                async for event in handle_stream_request(prepared, settings):
+                    yield event
+            finally:
+                lock.release()
 
         logger.info(
             "streaming chat completion started",
             session_id=prepared.session_id,
         )
         return StreamingResponse(
-            handle_stream_request(prepared, settings),
+            _locked_stream(),
             media_type="text/event-stream",
             headers={
                 "X-Session-ID": prepared.session_id,
@@ -234,15 +283,17 @@ async def chat_completions(
             },
         )
 
-    async with aiosqlite.connect(settings.db_path) as conn:
-        await conn.execute("PRAGMA journal_mode=WAL")
-        response_data, session_id = await handle_request(
-            request=request,
-            session_id_header=x_session_id,
-            settings=settings,
-            triton_client=triton_client,
-            conn=conn,
-        )
+    async with lock:
+        async with aiosqlite.connect(settings.db_path) as conn:
+            await conn.execute("PRAGMA journal_mode=WAL")
+            response_data, session_id = await handle_request(
+                request=request,
+                session_id_header=session_key,
+                settings=settings,
+                triton_client=triton_client,
+                conn=conn,
+                client_headers=client_headers,
+            )
 
     logger.info("chat completion response sent", session_id=session_id)
     if "response_body" in settings.verbose_log_events:
@@ -258,12 +309,6 @@ async def chat_completions(
 # MUST be declared last so the routes above take priority.
 # ---------------------------------------------------------------------------
 
-# Headers that must not be forwarded (hop-by-hop or host-specific).
-_HOP_BY_HOP = frozenset({
-    "host", "transfer-encoding", "te", "trailers",
-    "connection", "keep-alive", "upgrade", "proxy-authorization",
-})
-
 
 @router.api_route("/{path:path}", methods=["GET", "POST", "PUT", "PATCH", "DELETE", "OPTIONS", "HEAD"])
 async def llm_proxy(
@@ -274,21 +319,22 @@ async def llm_proxy(
     """Transparent reverse-proxy for all paths not handled by PCM.
 
     Forwards the original method, path, query string, body, and headers
-    (minus hop-by-hop headers) to the downstream LLM endpoint and streams
-    the response back unchanged.  The LLM API key is injected if configured.
+    (minus hop-by-hop and protocol-managed headers) to the downstream LLM
+    endpoint and returns the response unchanged.  The LLM API key is injected
+    if configured.
     """
     target_url = f"{settings.llm_url.rstrip('/')}/{path}"
     if raw_request.url.query:
         target_url = f"{target_url}?{raw_request.url.query}"
 
-    # Build forwarded headers: drop hop-by-hop, inject auth if present.
-    forward_headers = {
-        k: v
-        for k, v in raw_request.headers.items()
-        if k.lower() not in _HOP_BY_HOP
-    }
-    if settings.llm_api_key:
-        forward_headers["authorization"] = f"Bearer {settings.llm_api_key}"
+    # Forward client headers verbatim except hop-by-hop / protocol headers.
+    # ``force_json=False`` preserves the original content type (the proxy is
+    # used for arbitrary endpoints such as ``/v1/models``).
+    forward_headers = build_forward_headers(
+        raw_request.headers,
+        api_key=settings.llm_api_key,
+        force_json=False,
+    )
 
     body = await raw_request.body()
 
@@ -307,12 +353,8 @@ async def llm_proxy(
             content=body,
         )
 
-    # Strip hop-by-hop headers from the response before forwarding.
-    response_headers = {
-        k: v
-        for k, v in llm_resp.headers.items()
-        if k.lower() not in _HOP_BY_HOP
-    }
+    # Strip headers that no longer describe the (decoded) response body.
+    response_headers = build_response_headers(llm_resp.headers)
 
     logger.info(
         "proxy passthrough response",

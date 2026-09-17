@@ -7,17 +7,20 @@ OpenAI-compatible privacy mid-layer that sits between a client and any downstrea
 ```
 Client
   │  POST /v1/chat/completions
-  │  X-Session-ID: <uuid>   (optional)
+  │  model: <client-chosen>                     (authoritative)
+  │  X-Session-ID / x-opencode-session / …      (any x…session… header, optional)
   ▼
 PCM
-  ├─ 1. Resolve session ID (header → existing session, absent → new UUID)
+  ├─ 1. Resolve session ID (session header → existing session, absent → UUID)
   ├─ 2. Load session from SQLite (or create empty)
   ├─ 3. Identify new messages (everything past the stored history cursor)
   ├─ 4. For each new filterable message:
   │       → Triton: plain text in, RedactionResult out
   │       → apply_placeholder_indexing: base placeholders → <LABEL_N>
   │       → store redacted copy in hidden_messages
-  ├─ 5. Forward hidden_messages to the downstream LLM
+  ├─ 5. Forward hidden_messages to the downstream LLM, using the client's
+  │       model and the client's headers (minus hop-by-hop/technical ones);
+  │       optionally re-emit the session id as PCM_LLM_SESSION_HEADER
   ├─ 6. De-anonymise the LLM response (replace <LABEL_N> → original text)
   │       • stream=false: buffer the full response, then substitute
   │       • stream=true:  substitute each SSE delta in real time
@@ -38,6 +41,30 @@ Each session stores three independent things in SQLite:
 | `privacy_state` | Placeholder map, per-type counters, redaction audit log | Never |
 
 The **cursor** mechanism allows clients to follow standard OpenAI conventions (send the full history every turn). PCM slices from `len(hidden_messages)` onward to find only the new messages, so previously processed turns are never re-sent to Triton.
+
+### Conversation namespacing
+
+The client's session id is namespaced per conversation:
+
+```
+<client-session-id>::<sha1(first user message)[:12]>
+```
+
+When the client sends **no** session header (e.g. Hermes pointed at a custom
+endpoint), the fingerprint alone is used as the key (`auto-<hash>`), so turns of
+one conversation still accumulate history instead of each getting a random id.
+
+Many agents issue *side-channel* requests that reuse their session id but carry a
+different, unrelated message list — for example opencode's title generator. Such
+requests have a different first user message, so they map to a separate stored
+session instead of colliding with the main conversation (which previously
+caused history corruption and `422` errors). Requests for one namespaced key are
+serialised, and the `X-Session-ID` response header carries the resolved key
+(echoing it back is a no-op). The right-hand side is a hash, not raw PII.
+
+> Caveat: two unrelated header-less conversations whose first user message is
+> byte-identical will share a session. Client-supplied session ids avoid this.
+
 
 ## Placeholder indexing
 
@@ -146,8 +173,11 @@ Standard OpenAI `ChatCompletion` fields plus:
   text around a partial tag may be delayed by at most one placeholder length.
 
 In both modes the resolved session ID is returned in the `X-Session-ID`
-**response header**. Pass it back as `X-Session-ID` on the next request to
-continue the same session.
+**response header**. Pass it back as `X-Session-ID` (or any `x…session…`
+header) on the next request to continue the same session. If the client sends
+a different session header — e.g. `x-session-affinity`, `x-opencode-session`
+or `X-Hermes-Session-Id` — its value is used instead, which lets agents that
+manage their own session ids resume conversations transparently.
 
 ## Configuration
 
@@ -155,11 +185,13 @@ All settings are read from environment variables with the `PCM_` prefix.
 
 | Variable | Required | Default | Description |
 |---|---|---|---|
-| `PCM_LLM_URL` | yes | — | Base URL of the downstream LLM (e.g. `http://vllm:8000`) |
-| `PCM_LLM_MODEL_NAME` | yes | — | Model name forwarded in every LLM request |
+| `PCM_LLM_URL` | yes | — | Base URL of the downstream LLM (e.g. `http://vllm:8000`). PCM appends `/v1/…`; a trailing `/v1` is stripped automatically |
+| `PCM_LLM_MODEL_NAME` | no | `""` | Fallback model used only when the client omits `model`. The client-supplied model always wins |
 | `PCM_LLM_API_KEY` | no | `""` | Bearer token for the LLM endpoint |
+| `PCM_LLM_SESSION_HEADER` | no | auto | Upstream-specific session header. Auto-defaults to `x-opencode-session` when `PCM_LLM_URL` host is `opencode.ai`; set explicitly for others (e.g. `X-Hermes-Session-Id`). PCM detects any client `x…session…` header and re-emits the resolved id under this name |
 | `PCM_TRITON_URL` | no | `localhost:8000` | Host and port of the Triton server |
 | `PCM_TRITON_MODEL_NAME` | no | `ensemble_model` | Triton model name |
+| `PCM_TRITON_MAX_CHARS` | no | `8000` | Max characters per Triton call; longer messages are split at natural boundaries and redacted chunk by chunk |
 | `PCM_DB_PATH` | no | `./sessions.db` | SQLite database path inside the container |
 | `PCM_HOST` | no | `0.0.0.0` | Uvicorn bind address |
 | `PCM_PORT` | no | `8080` | Uvicorn bind port |
@@ -223,7 +255,7 @@ Emits additional payloads at `DEBUG` level (requires `PCM_LOG_LEVEL=DEBUG`). Use
 |---|---|---|
 | `request_body` | yes | Incoming request + `X-Session-ID` header |
 | `redaction_result` | yes | Full Triton output including original span text |
-| `llm_payload` | no | Redacted payload forwarded to the LLM |
+| `llm_payload` | no | Redacted payload + forwarded headers sent to the LLM (auth/cookies redacted) |
 | `llm_raw_response` | no | Raw LLM response before de-anonymisation (buffered body, or the assembled stream with placeholders) |
 | `session_state` | yes | Full session after save (raw messages + privacy state) |
 | `response_body` | yes | Final de-anonymised response returned to the client (buffered body, or the assembled stream including `reasoning`) |

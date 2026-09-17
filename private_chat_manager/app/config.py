@@ -21,11 +21,43 @@ class Settings(BaseSettings):
     # Downstream LLM endpoint
     llm_url: str
     llm_api_key: str = ""
-    llm_model_name: str
+    # Optional fallback model used when the client does not send one.
+    llm_model_name: str | None = None
+    # Optional upstream-specific session header (e.g. "x-opencode-session" for
+    # the OpenCode Zen gateway, "X-Hermes-Session-Id" for Hermes).  When set,
+    # the resolved client session id is also emitted under this name.  Leave
+    # empty for upstreams that need no session header (vLLM, OpenRouter, …).
+    llm_session_header: str | None = None
+
+    @field_validator("llm_url", mode="after")
+    @classmethod
+    def _normalize_llm_url(cls, v: str) -> str:
+        """Normalise the downstream base URL.
+
+        PCM always appends ``/v1/...`` itself, so a base that already ends in
+        ``/v1`` (a common user mistake) is de-duplicated here.  Trailing
+        slashes are stripped so the join never produces ``//``.
+        """
+        url = v.strip().rstrip("/")
+        if url.lower().endswith("/v1"):
+            url = url[:-3].rstrip("/")
+        return url
+
+    @field_validator("llm_session_header", mode="before")
+    @classmethod
+    def _parse_llm_session_header(cls, v: Any) -> str | None:
+        if v is None:
+            return None
+        name = str(v).strip()
+        return name or None
 
     # Triton privacy-filter server
     triton_url: str = "localhost:8000"
     triton_model_name: str = "ensemble_model"
+    # Maximum characters sent to Triton in one inference request.  Longer
+    # messages are split at natural boundaries and redacted chunk by chunk
+    # (the ensemble OOMs on very long inputs).  <=0 disables the limit.
+    triton_max_chars: int = 8000
 
     # Embedded session database
     db_path: str = "./sessions.db"
@@ -94,7 +126,7 @@ class Settings(BaseSettings):
     # Available events:
     #   request_body      — incoming PrivateChatRequest + X-Session-ID header
     #   redaction_result  — full Triton response including original PII spans (⚠ contains PII)
-    #   llm_payload       — full payload sent to the LLM (hidden/redacted messages)
+    #   llm_payload       — redacted payload + forwarded headers sent to the LLM
     #   llm_raw_response  — raw LLM response before de-anonymisation
     #   session_state     — full session (raw + hidden messages + privacy state) after save (⚠ contains PII)
     #   response_body     — final de-anonymised response returned to the client (⚠ contains PII)

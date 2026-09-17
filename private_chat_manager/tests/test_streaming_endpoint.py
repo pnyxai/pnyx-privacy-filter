@@ -42,10 +42,10 @@ def stream_body(chunks: list[dict]) -> str:
     return "".join(sse(c) for c in chunks) + "data: [DONE]\n\n"
 
 
-async def collect_events(client, payload: dict):
+async def collect_events(client, payload: dict, headers: dict | None = None):
     events: list[dict] = []
     async with client.stream(
-        "POST", "/v1/chat/completions", json=payload
+        "POST", "/v1/chat/completions", json=payload, headers=headers
     ) as response:
         session_id = response.headers.get("x-session-id")
         content_type = response.headers.get("content-type", "")
@@ -500,10 +500,14 @@ async def test_persisted_content_matches_between_stream_and_nonstream(client):
         "messages": [{"role": "user", "content": "My name is Lionel Messi."}],
     }
     buffered = await client.post(
-        "/v1/chat/completions", json={**payload, "stream": False}
+        "/v1/chat/completions",
+        json={**payload, "stream": False},
+        headers={"X-Session-Id": "parity-buffered"},
     )
     _, streamed_id, _, _, _ = await collect_events(
-        client, {**payload, "stream": True}
+        client,
+        {**payload, "stream": True},
+        headers={"X-Session-Id": "parity-streamed"},
     )
 
     buffered_session = (
@@ -586,10 +590,14 @@ async def test_persisted_tool_calls_match_between_stream_and_nonstream(client):
         "messages": [{"role": "user", "content": "My name is Lionel Messi."}],
     }
     buffered = await client.post(
-        "/v1/chat/completions", json={**payload, "stream": False}
+        "/v1/chat/completions",
+        json={**payload, "stream": False},
+        headers={"X-Session-Id": "parity-buffered"},
     )
     _, streamed_id, _, _, _ = await collect_events(
-        client, {**payload, "stream": True}
+        client,
+        {**payload, "stream": True},
+        headers={"X-Session-Id": "parity-streamed"},
     )
 
     buffered_session = (
@@ -690,5 +698,37 @@ async def test_residual_events_keep_reasoning_content_key(client):
     reasoning_content = "".join(d.get("reasoning_content", "") for d in deltas)
     assert reasoning_content == "think <SEC"
     assert not any(d.get("reasoning") for d in deltas)
+
+
+@pytest.mark.asyncio
+@respx.mock
+async def test_streaming_forwards_model_and_injects_session_header(make_client):
+    client = await make_client(llm_session_header="x-opencode-session")
+    body = stream_body(
+        [
+            chunk({"role": "assistant", "content": "hi"}),
+            chunk({}, finish_reason="stop"),
+        ]
+    )
+    route = respx.post(LLM_URL).mock(
+        return_value=httpx.Response(
+            200, content=body.encode(), headers={"content-type": "text/event-stream"}
+        )
+    )
+    payload = {
+        "model": "minimax-m3",
+        "messages": [{"role": "user", "content": "hi"}],
+        "stream": True,
+    }
+    status, session_id, _, _, _ = await collect_events(
+        client, payload, headers={"X-Session-Id": "sess-stream"}
+    )
+
+    assert status == 200
+    assert session_id.startswith("sess-stream::")
+    upstream = route.calls.last.request
+    assert json.loads(upstream.content)["model"] == "minimax-m3"
+    assert upstream.headers.get("x-opencode-session") == session_id
+
 
 
