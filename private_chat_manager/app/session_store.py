@@ -55,6 +55,35 @@ async def get_session(
     )
 
 
+async def find_sessions_by_base(
+    conn: aiosqlite.Connection, base_id: str
+) -> list[SessionData]:
+    """Return all namespaced sessions whose key starts with ``base_id::``.
+
+    Internal session keys are ``<client-id>::<conversation-fingerprint>``; this
+    lets the inspect endpoint resolve a client-facing id to its conversations.
+    """
+    async with conn.execute(
+        "SELECT session_id, created_at, updated_at, "
+        "raw_messages, hidden_messages, privacy_state "
+        "FROM sessions WHERE session_id LIKE ? ORDER BY updated_at DESC",
+        (f"{base_id}::%",),
+    ) as cursor:
+        rows = await cursor.fetchall()
+
+    return [
+        SessionData(
+            session_id=row[0],
+            created_at=row[1],
+            updated_at=row[2],
+            raw_messages=json.loads(row[3]),
+            hidden_messages=json.loads(row[4]),
+            privacy_state=PrivacyFilterState(**json.loads(row[5])),
+        )
+        for row in rows
+    ]
+
+
 async def save_session(conn: aiosqlite.Connection, data: SessionData) -> None:
     """Upsert *data* into the sessions table."""
     await conn.execute(

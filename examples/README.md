@@ -22,8 +22,9 @@ Edit `.env` and fill in at minimum:
 |---|---|
 | `TRITON_MODELS_PATH` | Absolute host path to the model weights directory |
 | `TRITON_WEIGHT_MAPPINGS` | ONNX symlink mappings — see [`docker/triton/README.md`](../docker/triton/README.md) |
-| `PCM_LLM_URL` | Base URL of the downstream LLM (e.g. `http://host.docker.internal:8000`) |
-| `PCM_LLM_MODEL_NAME` | Model name forwarded in every LLM request |
+| `PCM_LLM_URL` | Base URL of the downstream LLM (e.g. `http://host.docker.internal:8000`); PCM appends `/v1/…` |
+| `PCM_LLM_MODEL_NAME` | Optional fallback model used only when the client omits `model` |
+| `PCM_LLM_SESSION_HEADER` | Optional upstream session header; auto-defaults to `x-opencode-session` for `opencode.ai` upstreams |
 
 All variables are documented inline in `sample.env`.
 

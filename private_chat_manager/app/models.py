@@ -69,6 +69,7 @@ class PrivateChatRequest(BaseModel):
     logprobs: bool | None = None
     top_logprobs: int | None = None
     stream: bool | None = False
+    stream_options: dict[str, Any] | None = None
     tools: list[dict[str, Any]] | None = None
     tool_choice: str | dict[str, Any] | None = None
     response_format: dict[str, Any] | None = None

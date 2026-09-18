@@ -35,7 +35,7 @@ class Pipeline:
 
         # Model name forwarded in the request body to PCM (and on to the LLM).
         # Override per-deployment via Admin Panel → Pipelines.
-        PCM_LLM_MODEL_NAME: str = "meta-llama/Llama-3-8B-Instruct"
+        PCM_LLM_MODEL_NAME: Optional[str] = None
 
     # ──────────────────────────────────────────────────────────────────────────
     def __init__(self):
@@ -45,7 +45,7 @@ class Pipeline:
         self.valves = self.Valves(
             PCM_URL=os.getenv("PCM_URL", "http://pnyx-pcm:8080"),
             PCM_API_KEY=os.getenv("PCM_API_KEY", ""),
-            PCM_LLM_MODEL_NAME=os.getenv("PCM_LLM_MODEL_NAME", "meta-llama/Llama-3-8B-Instruct"),
+            PCM_LLM_MODEL_NAME=os.getenv("PCM_LLM_MODEL_NAME", None),
         )
 
         # Open WebUI sends chat_id only in filter/inlet calls, not in the LLM
@@ -115,8 +115,12 @@ class Pipeline:
         # ── 3. Build payload ───────────────────────────────────────────────
         payload = {**body}
         # Override model with the operator-configured value.
-        payload["model"] = self.valves.PCM_LLM_MODEL_NAME
-        # PCM does not support streaming.
+        if self.valves.PCM_LLM_MODEL_NAME:
+            payload["model"] = self.valves.PCM_LLM_MODEL_NAME
+        # This pipe returns a single JSON completion (see `r.json()` below), so
+        # it must ask PCM for a buffered response. Open WebUI sends
+        # `stream: true` by default; forwarding that would make PCM reply with
+        # SSE and the JSON parse below would fail.
         payload["stream"] = False
         # Open WebUI sends 'user' as a dict {name, id, email, role}; the
         # OpenAI spec (and PCM) expect it to be a string or absent.

@@ -75,11 +75,20 @@ services:
       - pcm-data:/data
     environment:
       PCM_LLM_URL:          ${PCM_LLM_URL}
-      PCM_LLM_MODEL_NAME:   ${PCM_LLM_MODEL_NAME}
+      # Optional fallback used only when the client omits the model.
+      PCM_LLM_MODEL_NAME:   ${PCM_LLM_MODEL_NAME:-}
       PCM_LLM_API_KEY:      ${PCM_LLM_API_KEY}
+      # Optional upstream-specific session header. When set, PCM re-emits the
+      # resolved client session id under this name (e.g. "x-opencode-session"
+      # for the OpenCode Zen gateway, "X-Hermes-Session-Id" for Hermes).
+      # Leave empty for upstreams that need none (vLLM, OpenRouter, OpenAI).
+      PCM_LLM_SESSION_HEADER: ${PCM_LLM_SESSION_HEADER:-}
       # PCM talks to Triton by service name on the shared network
       PCM_TRITON_URL:       pnyx-pf-triton:8000
       PCM_TRITON_MODEL_NAME: ensemble_model
+      # Max characters per Triton inference call; longer messages are split
+      # at natural boundaries and redacted chunk by chunk.
+      PCM_TRITON_MAX_CHARS: ${PCM_TRITON_MAX_CHARS:-8000}
       PCM_DB_PATH:          ${PCM_DB_PATH}
       PCM_LOG_LEVEL:        ${PCM_LOG_LEVEL}
       # Comma-separated verbose event names to emit at DEBUG level (requires PCM_LOG_LEVEL=DEBUG).
@@ -89,6 +98,12 @@ services:
       # Comma-separated roles sent through the Triton privacy filter.
       # Default: user,tool,function — add "system" to also redact system prompts.
       PCM_FILTERABLE_ROLES: ${PCM_FILTERABLE_ROLES}
+      # Comma-separated labels the streaming de-anonymiser recognises.
+      # Defaults to the openai/privacy-filter v2 taxonomy when unset.
+      PCM_PLACEHOLDER_LABELS: ${PCM_PLACEHOLDER_LABELS}
+      # Optional text appended to the system prompt explaining placeholder tags.
+      # Empty/unset disables injection.
+      PCM_SYSTEM_PROMPT_PII_INSTRUCTION: ${PCM_SYSTEM_PROMPT_PII_INSTRUCTION}
     # Allows the container to reach services bound on the host
     # Set PCM_LLM_URL=http://host.docker.internal:<port> in your .env.
     extra_hosts:
