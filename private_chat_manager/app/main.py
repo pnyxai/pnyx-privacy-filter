@@ -351,6 +351,13 @@ async def chat_completions(
                     timings=timings,
                 )
         except BaseException:
+            # A failure before the stream exists has no _finish() to emit
+            # timing; emit the fallback here (once) before releasing.
+            timings.log_timing(
+                session_id_hint=client_session_value or "new",
+                stream=True,
+                error=True,
+            )
             lock.release()
             raise
 
@@ -379,19 +386,30 @@ async def chat_completions(
             },
         )
 
-    async with lock:
-        async with aiosqlite.connect(settings.db_path) as conn:
-            await conn.execute("PRAGMA journal_mode=WAL")
-            response_data, client_x_session_id = await handle_request(
-                request=request,
-                client_session_value=client_session_value,
-                settings=settings,
-                triton_client=triton_client,
-                conn=conn,
-                client_headers=client_headers,
-                llm_url=llm_url,
-                timings=timings,
-            )
+    try:
+        async with lock:
+            async with aiosqlite.connect(settings.db_path) as conn:
+                await conn.execute("PRAGMA journal_mode=WAL")
+                response_data, client_x_session_id = await handle_request(
+                    request=request,
+                    client_session_value=client_session_value,
+                    settings=settings,
+                    triton_client=triton_client,
+                    conn=conn,
+                    client_headers=client_headers,
+                    llm_url=llm_url,
+                    timings=timings,
+                )
+    except BaseException:
+        # Validation, Triton, upstream, parsing or persistence failures leave
+        # handle_request before its success-path timing; emit the fallback so
+        # every request is accounted for exactly once.
+        timings.log_timing(
+            session_id_hint=client_session_value or "new",
+            stream=False,
+            error=True,
+        )
+        raise
 
     logger.info("chat completion response sent", session_id=client_x_session_id)
     if "response_body" in settings.verbose_log_events:
@@ -451,32 +469,41 @@ async def llm_proxy(
         target=target_url,
     )
 
-    async with httpx.AsyncClient(timeout=120.0) as client:
-        llm_resp = await client.request(
+    try:
+        async with httpx.AsyncClient(timeout=120.0) as client:
+            llm_resp = await client.request(
+                method=raw_request.method,
+                url=target_url,
+                headers=forward_headers,
+                content=body,
+            )
+
+        # Strip headers that no longer describe the (decoded) response body.
+        response_headers = build_response_headers(llm_resp.headers)
+        timings.mark("upstream")
+
+        logger.info(
+            "proxy passthrough response",
             method=raw_request.method,
-            url=target_url,
-            headers=forward_headers,
-            content=body,
+            path=f"/{path}",
+            status_code=llm_resp.status_code,
         )
-
-    # Strip headers that no longer describe the (decoded) response body.
-    response_headers = build_response_headers(llm_resp.headers)
-    timings.mark("upstream")
-
-    logger.info(
-        "proxy passthrough response",
-        method=raw_request.method,
-        path=f"/{path}",
-        status_code=llm_resp.status_code,
-    )
-    timings.mark("finalize")
-    logger.info(
-        "request timing",
-        method=raw_request.method,
-        path=f"/{path}",
-        stream=False,
-        **timings.as_fields(),
-    )
+        timings.mark("finalize")
+        timings.log_timing(
+            method=raw_request.method,
+            path=f"/{path}",
+            stream=False,
+        )
+    except httpx.HTTPError:
+        # Transport/status failures skip the success-path timing; account for
+        # them (once) before propagating.
+        timings.log_timing(
+            method=raw_request.method,
+            path=f"/{path}",
+            stream=False,
+            error=True,
+        )
+        raise
 
     return Response(
         content=llm_resp.content,

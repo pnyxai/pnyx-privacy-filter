@@ -24,12 +24,19 @@ import time
 from dataclasses import dataclass, field
 from typing import Any
 
+from ._logging import get_logger
+
+logger = get_logger(__name__)
+
 
 @dataclass
 class RequestTimings:
     start: float = field(default_factory=lambda: time.monotonic())
     _last: float = field(default_factory=lambda: time.monotonic())
     phases: dict[str, float] = field(default_factory=dict)
+    # Set once a summary has been logged so failure-path fallbacks cannot emit a
+    # second, partial event for the same request.
+    emitted: bool = False
 
     def mark(self, name: str) -> float:
         """Record the elapsed ms since the previous mark under *name*.
@@ -55,3 +62,16 @@ class RequestTimings:
         }
         fields["total_ms"] = round(self.total_ms, 1)
         return fields
+
+    def log_timing(self, **fields: Any) -> None:
+        """Emit the single ``request timing`` event for this request, once.
+
+        Success paths call this after marking every phase; failure paths call it
+        from a ``finally``/``except`` so every request is still accounted for.
+        The :attr:`emitted` guard makes repeated calls a no-op, so a later
+        failure fallback cannot overwrite a completed summary.
+        """
+        if self.emitted:
+            return
+        self.emitted = True
+        logger.info("request timing", **fields, **self.as_fields())

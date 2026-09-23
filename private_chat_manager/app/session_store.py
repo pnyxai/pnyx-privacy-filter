@@ -24,6 +24,19 @@ CREATE TABLE IF NOT EXISTS sessions (
 )
 """
 
+# Columns added after the original 6-column ``sessions`` table.  Existing
+# databases created before these were introduced must be migrated with
+# ``ALTER TABLE ADD COLUMN`` (``CREATE TABLE IF NOT EXISTS`` is a no-op there),
+# otherwise creating an index on ``user_hash`` and every later SELECT fail.
+_SESSION_COLUMNS: dict[str, str] = {
+    "client_x_session_header": "TEXT",
+    "endpoint_x_session_header": "TEXT",
+    "user_hash": "TEXT",
+    "parent_session_id": "TEXT",
+    "root_session_id": "TEXT",
+    "origin_message_count": "INTEGER",
+}
+
 _CREATE_USER_HASH_INDEX_SQL = (
     "CREATE INDEX IF NOT EXISTS idx_sessions_user_hash ON sessions(user_hash)"
 )
@@ -93,6 +106,24 @@ def _row_to_session(row: tuple) -> SessionData:
     )
 
 
+async def _migrate_sessions(conn: aiosqlite.Connection) -> None:
+    """Add any post-initial columns missing from an existing ``sessions`` table.
+
+    ``CREATE TABLE IF NOT EXISTS`` leaves a pre-existing table untouched, so a
+    database created before the lineage/identity columns were introduced would
+    otherwise fail when the ``user_hash`` index (and later queries) reference a
+    column that does not exist.  SQLite ``ALTER TABLE ADD COLUMN`` is additive
+    and safe for the nullable columns added here.
+    """
+    async with conn.execute("PRAGMA table_info(sessions)") as cursor:
+        existing = {row[1] for row in await cursor.fetchall()}
+    for name, column_type in _SESSION_COLUMNS.items():
+        if name not in existing:
+            await conn.execute(
+                f"ALTER TABLE sessions ADD COLUMN {name} {column_type}"
+            )
+
+
 async def ensure_schema(db_path: str) -> None:
     """Create the sessions table and indexes if they do not yet exist.
 
@@ -101,6 +132,7 @@ async def ensure_schema(db_path: str) -> None:
     async with aiosqlite.connect(db_path) as conn:
         await conn.execute("PRAGMA journal_mode=WAL")
         await conn.execute(_CREATE_TABLE_SQL)
+        await _migrate_sessions(conn)
         await conn.execute(_CREATE_SESSION_HASHES_SQL)
         await conn.execute(_CREATE_USER_HASH_INDEX_SQL)
         await conn.execute(_CREATE_UPDATED_AT_INDEX_SQL)

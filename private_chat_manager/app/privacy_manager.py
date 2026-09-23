@@ -164,8 +164,14 @@ def _same_message(stored: Mapping[str, Any], client: Mapping[str, Any]) -> bool:
 
     ``raw_messages`` holds exactly what the client sent (user/system/tool) or
     the de-anonymised assistant reply it received, so a matching client message
-    is byte-identical.  Compared on role, content and tool-call ids — not the
-    reasoning/refusal side channels, which the client may or may not echo.
+    is byte-identical.  Compared on role, content and every semantic tool-call
+    field — not the reasoning/refusal side channels, which the client may or may
+    not echo.
+
+    Every tool-call field (arguments, function name, ids and the legacy
+    ``function_call``/``function_calls`` shapes) is compared so that an edit to
+    a call — not just its id — is detected as divergence and re-redacted on a
+    new branch rather than silently skipped in favour of the cached hidden copy.
 
     NOTE (future forking): this is a whole-message comparison.  Giving each
     stored message a stable identity (a message id or content hash) would allow
@@ -175,9 +181,14 @@ def _same_message(stored: Mapping[str, Any], client: Mapping[str, Any]) -> bool:
         return False
     if stored.get("content") != client.get("content"):
         return False
-    stored_ids = {tc.get("id") for tc in stored.get("tool_calls") or []}
-    client_ids = {tc.get("id") for tc in client.get("tool_calls") or []}
-    return stored_ids == client_ids
+    semantic_fields = (
+        "name",
+        "tool_call_id",
+        "tool_calls",
+        "function_call",
+        "function_calls",
+    )
+    return all(stored.get(key) == client.get(key) for key in semantic_fields)
 
 
 def _common_prefix_len(stored: list[dict[str, Any]], client: list[dict[str, Any]]) -> int:
@@ -345,6 +356,78 @@ def compute_prefix_user_hash(messages: list[dict[str, Any]]) -> str:
     return compute_user_hash(messages[:last_user_index])
 
 
+def _collect_text(messages: list[dict[str, Any]]) -> str:
+    """Concatenate every text-bearing field of *messages*."""
+    parts: list[str] = []
+    for message in messages:
+        if not isinstance(message, dict):
+            continue
+        for field in message_fields():
+            for slot in field.iter_slots(message):
+                text = slot.get()
+                if text:
+                    parts.append(text)
+    return "\n".join(parts)
+
+
+def _counters_from_placeholder_map(
+    placeholder_map: Mapping[str, str],
+) -> dict[str, int]:
+    """Rebuild per-label counters from the highest index in *placeholder_map*.
+
+    Placeholder keys are ``<LABEL_N>``; the counter for ``LABEL`` is the largest
+    ``N`` seen.  Used when pruning a forked session so new spans continue the
+    numbering without colliding with (or skipping past) retained tokens.
+    """
+    counters: dict[str, int] = {}
+    for placeholder in placeholder_map:
+        label, _, index = placeholder.rstrip(">").lstrip("<").rpartition("_")
+        if label and index.isdigit():
+            counters[label] = max(counters.get(label, 0), int(index))
+    return counters
+
+
+def _prune_privacy_state(
+    state: PrivacyFilterState,
+    retained_hidden: list[dict[str, Any]],
+    retained_raw: list[dict[str, Any]],
+) -> PrivacyFilterState:
+    """Restrict *state* to the privacy facts of a session's retained prefix.
+
+    A fork keeps only the shared message prefix, so inheriting the parent's full
+    privacy state would carry over placeholder→PII mappings and audit results
+    for turns that no longer exist on the branch.  A stale token that is later
+    echoed (by the LLM or injected by a client) would then de-anonymise to PII
+    from a discarded turn.  This keeps only:
+
+    * placeholder-map entries whose token literally appears in the retained
+      hidden messages (exactly the ones needed to de-anonymise the prefix);
+    * counters rebuilt from those tokens;
+    * audit results whose detected span text occurs in the retained raw
+      messages (a discarded-only value is never exposed).
+    """
+    retained_hidden_text = _collect_text(retained_hidden)
+    placeholder_map = {
+        placeholder: value
+        for placeholder, value in state.placeholder_map.items()
+        if placeholder in retained_hidden_text
+    }
+    retained_raw_text = _collect_text(retained_raw)
+    redaction_results = [
+        result
+        for result in state.redaction_results
+        if all(
+            span.get("text") and span["text"] in retained_raw_text
+            for span in result.get("detected_spans", [])
+        )
+    ]
+    return PrivacyFilterState(
+        placeholder_map=placeholder_map,
+        type_counters=_counters_from_placeholder_map(placeholder_map),
+        redaction_results=redaction_results,
+    )
+
+
 def _new_session(
     client_value: str | None,
     prefix_user_hash: str,
@@ -393,16 +476,18 @@ def _branch_session(parent: SessionData, cursor: int) -> SessionData:
     resolve the same family.
     """
     now = time.time()
+    retained_raw = list(parent.raw_messages[:cursor])
+    retained_hidden = list(parent.hidden_messages[:cursor])
     return SessionData(
         session_id=str(uuid.uuid4()),
         created_at=now,
         updated_at=now,
-        raw_messages=list(parent.raw_messages[:cursor]),
-        hidden_messages=list(parent.hidden_messages[:cursor]),
-        privacy_state=PrivacyFilterState(
-            placeholder_map=dict(parent.privacy_state.placeholder_map),
-            type_counters=dict(parent.privacy_state.type_counters),
-            redaction_results=list(parent.privacy_state.redaction_results),
+        raw_messages=retained_raw,
+        hidden_messages=retained_hidden,
+        # Prune the parent's privacy state to the retained prefix: a fork must
+        # not inherit placeholder mappings or audit results for discarded turns.
+        privacy_state=_prune_privacy_state(
+            parent.privacy_state, retained_hidden, retained_raw
         ),
         client_x_session_header=parent.client_x_session_header,
         endpoint_x_session_header=parent.endpoint_x_session_header,
@@ -981,8 +1066,20 @@ async def prepare_request(
         ]
 
     # Emit the PCM-controlled endpoint session id under the header the
-    # endpoint expects (if any), overriding any client-supplied value.
+    # endpoint expects (if any), overriding any client-supplied value.  The
+    # endpoint id is derived per request, not only at creation: an existing
+    # session resolved by hash/header may predate a policy change (e.g. an
+    # ``X-PCM-LLM-URL`` override that selects an endpoint requiring a session
+    # header), so it is validated/generated against the *effective* policy.
     policy = endpoint_session_policy(effective_llm_url, settings.llm_session_header)
+    if policy.header_name is not None and not policy.validate(
+        session.endpoint_x_session_header
+    ):
+        session.endpoint_x_session_header = (
+            client_session_value
+            if client_session_value and policy.validate(client_session_value)
+            else policy.generate()
+        )
     forward_headers = build_forward_headers(
         client_headers,
         api_key=settings.llm_api_key,
@@ -1178,12 +1275,10 @@ async def handle_request(
         )
 
     timings.mark("finalize")
-    logger.info(
-        "request timing",
+    timings.log_timing(
         session_id=session_id,
         model=prepared.llm_payload.get("model"),
         stream=False,
-        **timings.as_fields(),
     )
 
     return response_data, prepared.client_x_session_header
@@ -1437,12 +1532,10 @@ async def handle_stream_request(
             usage_seen=seen_usage,
         )
         timings.mark("finalize")
-        logger.info(
-            "request timing",
+        timings.log_timing(
             session_id=session_id,
             model=prepared.llm_payload.get("model"),
             stream=True,
-            **timings.as_fields(),
         )
 
     try:

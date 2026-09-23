@@ -163,3 +163,53 @@ async def test_proxy_honours_override(make_client):
     assert response.status_code == 200
     assert alt.called
     assert json.loads('{"object":"list","data":[]}') == response.json()
+
+
+@pytest.mark.asyncio
+@respx.mock
+async def test_override_to_session_header_endpoint_generates_endpoint_id(make_client):
+    """An existing session gains the endpoint session header on URL override.
+
+    The session is first created against a default endpoint that needs no
+    session header (``endpoint_x_session_header is None``).  A later request
+    overrides to an allowlisted opencode.ai endpoint, which requires
+    ``x-opencode-session``; the id must be derived from the *effective* policy.
+    """
+    client = await make_client(
+        llm_url_allowlist=frozenset({"https://opencode.ai"})
+    )
+    respx.post(DEFAULT_LLM).mock(return_value=httpx.Response(200, json=completion()))
+    opencode = respx.post("https://opencode.ai/v1/chat/completions").mock(
+        return_value=httpx.Response(200, json=completion())
+    )
+    headers = {"X-Session-ID": "s1"}
+
+    first = await client.post(
+        "/v1/chat/completions",
+        headers=headers,
+        json={"model": "m", "messages": [{"role": "user", "content": "u1"}]},
+    )
+    assert first.status_code == 200
+    session = (await client.get("/v1/sessions/s1")).json()
+    assert session["endpoint_x_session_header"] is None
+
+    # Continue the same conversation, overriding to opencode.ai.
+    a1 = first.json()["choices"][0]["message"]
+    second = await client.post(
+        "/v1/chat/completions",
+        headers={**headers, "X-PCM-LLM-URL": "https://opencode.ai"},
+        json={
+            "model": "m",
+            "messages": [
+                {"role": "user", "content": "u1"},
+                a1,
+                {"role": "user", "content": "u2"},
+            ],
+        },
+    )
+    assert second.status_code == 200
+    assert opencode.called
+    assert opencode.calls.last.request.headers.get("x-opencode-session")
+
+    session = (await client.get("/v1/sessions/s1")).json()
+    assert session["endpoint_x_session_header"]
