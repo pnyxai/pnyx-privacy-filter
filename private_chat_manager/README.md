@@ -84,10 +84,15 @@ A conversation is identified by **message content**, not by the client id:
   agent's title generator and its main chat), the one that shares the **most
   messages** wins; a true tie is broken at random.
 
-The endpoint session id is derived by PCM from the endpoint: a well-formed
-client value is reused, otherwise a fresh one is generated (and a malformed
-client value is replaced). The client-facing id is echoed in the `X-Session-ID`
-response header. Requests for one conversation are serialised.
+The endpoint session id is derived by PCM from the **effective per-request
+endpoint policy**: a well-formed client value is reused, otherwise a fresh one
+is generated (and a malformed client value is replaced). This is evaluated on
+every request, so an existing session routed to a different endpoint by an
+`X-PCM-LLM-URL` override still emits the endpoint's required session header. The
+client-facing id is echoed in the `X-Session-ID` response header. Requests for
+one conversation are serialised on the **answered-message hash** (the header is
+only a hint), so headerless, stale-header and rotated-header representations of
+the same conversation share one lock.
 
 > Caveat: two unrelated conversations whose replayed history is byte-identical
 > (the same longest shared prefix) collide until they diverge; one is picked at
@@ -99,8 +104,12 @@ response header. Requests for one conversation are serialised.
 
 The cursor is not assumed from the stored length. PCM computes the **longest
 common prefix (LCP)** between the client's replayed `messages` and the stored
-`raw_messages`, comparing role, content and tool-call ids (`_same_message`). The
-LCP length is the cursor; everything after it is treated as new.
+`raw_messages`. `_same_message` compares role, content and **every** semantic
+tool-call field (`tool_calls`, `tool_call_id`, `name`, and the legacy
+`function_call` / `function_calls`), so an edit to a call's arguments or function
+name — not only its id — is detected as divergence and re-redacted. The
+`reasoning`/`refusal` side channels are intentionally ignored (the client may or
+may not echo them). The LCP length is the cursor; everything after it is new.
 
 The governing rule:
 
@@ -153,6 +162,12 @@ which shares the actual messages.
 
 Forked sessions inherit the parent's client-facing id, so a fixed-header client
 keeps resolving the same family (the shared prefix disambiguates which branch).
+The branch's `privacy_state` is **pruned to the retained prefix**: only
+placeholder-map entries whose token actually appears in the inherited hidden
+messages are kept (counters are rebuilt from those tokens), and audit results
+whose span text is not present in the inherited raw messages are dropped. This
+ensures a stale token from a discarded turn can never de-anonymise discarded PII
+on the new branch.
 
 **Lineage (sessions are append-only).** Every divergence forks; no session row is
 ever rewritten. Each session records its lineage so the conversation tree is
@@ -189,6 +204,12 @@ When enabled, PCM purges expired sessions once at startup and then periodically
 in the background (every `PCM_SESSION_TTL_SWEEP`, default `10m`). Resolution
 also treats an expired session as absent, so a request arriving between sweeps
 starts a fresh conversation instead of reviving the old one.
+
+Resolution **touches** the session (bumps `updated_at`) before the potentially
+long redaction/upstream work, and the sweeper deletes a row only once it is idle
+for `PCM_SESSION_TTL + PCM_SESSION_TTL_GRACE` (`PCM_SESSION_TTL_GRACE` defaults
+to `120s`). Together these prevent the sweeper from deleting an in-flight
+request's session — and its `session_hashes` history — mid-request.
 
 
 ## Placeholder indexing
@@ -326,6 +347,7 @@ All settings are read from environment variables with the `PCM_` prefix.
 | `PCM_DB_PATH` | no | `./sessions.db` | SQLite database path inside the container |
 | `PCM_SESSION_TTL` | no | `0` (disabled) | Session time-to-live, counted from the last activity (`updated_at`). Duration with `s`/`m`/`h`/`d`/`w` units, integer or float (e.g. `30s`, `360m`, `6h`, `1.5d`, `2w`). Empty/`0` disables expiry |
 | `PCM_SESSION_TTL_SWEEP` | no | `10m` | How often the background sweeper purges expired sessions (same duration syntax). Only used when `PCM_SESSION_TTL` is enabled |
+| `PCM_SESSION_TTL_GRACE` | no | `120s` | Extra margin added to the TTL before physical deletion (same duration syntax), so an in-flight redaction/upstream/stream cannot have its session and history swept mid-request |
 | `PCM_HOST` | no | `0.0.0.0` | Uvicorn bind address |
 | `PCM_PORT` | no | `8080` | Uvicorn bind port |
 | `PCM_LOG_LEVEL` | no | `INFO` | Log verbosity: `DEBUG` \| `INFO` \| `WARNING` \| `ERROR` |
@@ -477,6 +499,13 @@ So the **Triton cost is `redact_ms`** (`resolve_ms` and the others do not call
 Triton). For a finer breakdown, the `message redacted` events logged during
 processing carry a per-field `elapsed_ms` (one per Triton call).
 
+Every request emits the event **exactly once**, including failures. A request
+that exits before completing the pipeline — empty body, rejected `X-PCM-LLM-URL`
+override, Triton error, upstream HTTP/transport error, response-parse or
+persistence failure — is still accounted for by a fallback emit with an
+`error=True` field. A guard on the timer makes the success emit and the fallback
+mutually exclusive, so a request never logs two timing events.
+
 Example:
 
 ```
@@ -500,12 +529,12 @@ with `method`/`path` instead of `session_id`/`model`.
 | `app/endpoints.py` | Endpoint registry: `PCM_LLM_URL` → session-header policy (matchers, validate/generate) |
 | `app/headers.py` | Generic HTTP header helpers (session-header resolution, forwarding, redaction) |
 | `app/streaming.py` | Real-time placeholder detection/replacement state machine (see its module docstring) |
-| `app/session_store.py` | SQLite read/write via aiosqlite |
+| `app/session_store.py` | SQLite read/write via aiosqlite (schema create + in-place column migration, TTL touch/purge) |
 | `app/session_lock.py` | Per-conversation async lock |
 | `app/triton_client.py` | HTTP client for the Triton inference endpoint |
-| `app/timing.py` | Per-request phase timer (`RequestTimings`) |
+| `app/timing.py` | Per-request phase timer (`RequestTimings`, idempotent once-only `log_timing`) |
 | `app/_logging.py` | Structured logging configuration (structlog) |
-| `tests/` | Unit + endpoint tests (session resolution, cursor/branching/undo, redaction, streaming, timing, endpoints, …) |
+| `tests/` | Unit + endpoint tests (session resolution, cursor/branching/undo, fork state pruning, schema migration, redaction, streaming, timing incl. failure paths, locks, endpoints, …) |
 
 ### Running the tests
 

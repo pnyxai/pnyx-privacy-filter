@@ -78,6 +78,36 @@ async def test_success_emits_exactly_one_timing(client, caplog):
 
 
 @pytest.mark.asyncio
+async def test_rejected_override_emits_timing_on_chat(make_client, capsys):
+    client = await make_client(llm_url_allowlist=frozenset({"http://alt.local"}))
+
+    response = await client.post(
+        "/v1/chat/completions",
+        json={"model": "m", "messages": [{"role": "user", "content": "hi"}]},
+        headers={"X-PCM-LLM-URL": "http://evil.local"},
+    )
+
+    assert response.status_code == 403
+    text = capsys.readouterr().out
+    assert text.count("request timing") == 1
+    assert "error=True" in text
+
+
+@pytest.mark.asyncio
+async def test_rejected_override_emits_timing_on_proxy(make_client, capsys):
+    client = await make_client(llm_url_allowlist=frozenset({"http://alt.local"}))
+
+    response = await client.get(
+        "/v1/models", headers={"X-PCM-LLM-URL": "http://evil.local"}
+    )
+
+    assert response.status_code == 403
+    text = capsys.readouterr().out
+    assert text.count("request timing") == 1
+    assert "error=True" in text
+
+
+@pytest.mark.asyncio
 @respx.mock
 async def test_streaming_prepare_failure_emits_timing(client, app, caplog):
     async def _boom(_text):

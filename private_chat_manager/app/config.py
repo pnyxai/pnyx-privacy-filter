@@ -133,6 +133,17 @@ class Settings(BaseSettings):
     def _parse_session_ttl(cls, v: Any) -> int:
         return parse_duration(v, setting="PCM_SESSION_TTL")
 
+    # Grace added to the TTL before the background sweeper physically deletes a
+    # session.  `updated_at` is refreshed when a session is resolved, but a very
+    # long redaction/upstream/stream can still outlive the TTL; this margin
+    # keeps the sweeper from deleting an in-flight session's row and history.
+    session_ttl_grace: int = 120
+
+    @field_validator("session_ttl_grace", mode="before")
+    @classmethod
+    def _parse_session_ttl_grace(cls, v: Any) -> int:
+        return parse_duration(v, setting="PCM_SESSION_TTL_GRACE")
+
     # How often the background sweeper purges expired sessions (same duration
     # syntax). Only used when PCM_SESSION_TTL is enabled.
     session_ttl_sweep: int = 600

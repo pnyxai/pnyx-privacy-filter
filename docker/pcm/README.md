@@ -30,14 +30,15 @@ All variables use the `PCM_` prefix.
 | `PCM_LLM_URL` | **yes** | — | Base URL of the downstream LLM, e.g. `http://vllm:8000`. PCM appends `/v1/…` itself; a trailing `/v1` is stripped automatically |
 | `PCM_LLM_MODEL_NAME` | no | `""` | Fallback model used only when the client omits `model`, e.g. `meta-llama/Llama-3-8B-Instruct`. The client-supplied model always wins |
 | `PCM_LLM_API_KEY` | no | `""` | Bearer token for the LLM endpoint (leave empty if not required) |
-| `PCM_LLM_SESSION_HEADER` | no | auto | Upstream session header. Resolved by the endpoint registry (`app/endpoints.py`): built-in rule maps an `opencode.ai` host to `x-opencode-session`; set explicitly to override for other endpoints. PCM derives the endpoint session id and emits it under this name, overriding any client value |
+| `PCM_LLM_SESSION_HEADER` | no | auto | Upstream session header. Resolved by the endpoint registry (`app/endpoints.py`): built-in rule maps an `opencode.ai` host to `x-opencode-session`; set explicitly to override for other endpoints. The endpoint session id is derived from the **effective per-request policy**, so a request routed to another endpoint via `X-PCM-LLM-URL` still emits the right header, overriding any client value |
 | `PCM_LLM_URL_ALLOWLIST` | no | `""` | Base URLs a request may select for one call via the `X-PCM-LLM-URL` header (testing aid; empty disables). Stripped before forwarding upstream |
 | `PCM_TRITON_URL` | no | `localhost:8000` | Host and port of the Triton inference server |
 | `PCM_TRITON_MODEL_NAME` | no | `ensemble_model` | Triton model name to call for privacy filtering |
 | `PCM_TRITON_MAX_CHARS` | no | `8000` | Max characters per Triton call; longer messages are split at natural boundaries and redacted chunk by chunk |
 | `PCM_DB_PATH` | no | `./sessions.db` | Path inside the container for the SQLite session database |
-| `PCM_SESSION_TTL` | no | `0` (disabled) | Session time-to-live from last activity; duration with `s`/`m`/`h`/`d`/`w` units, integer or float (e.g. `30s`, `360m`, `6h`, `1.5d`, `2w`). Empty/`0` disables |
+| `PCM_SESSION_TTL` | no | `0` (disabled) | Session time-to-live from last activity; duration with `s`/`m`/`h`/`d`/`w` units, integer or float (e.g. `30s`, `360m`, `6h`, `1.5d`, `2w`). Empty/`0` disables. A session is touched when resolved so an in-flight request's row is not swept |
 | `PCM_SESSION_TTL_SWEEP` | no | `10m` | Background purge interval (same syntax); used only when `PCM_SESSION_TTL` is enabled |
+| `PCM_SESSION_TTL_GRACE` | no | `120s` | Extra margin added to the TTL before physical deletion, so a long redaction/upstream/stream cannot have its session (and history) swept mid-request. Same duration syntax |
 | `PCM_HOST` | no | `0.0.0.0` | Bind address for the uvicorn server |
 | `PCM_PORT` | no | `8080` | Bind port for the uvicorn server |
 | `PCM_LOG_LEVEL` | no | `INFO` | Log verbosity: `DEBUG` \| `INFO` \| `WARNING` \| `ERROR` |

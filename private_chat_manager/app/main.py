@@ -51,7 +51,7 @@ async def _session_ttl_sweeper(settings: Settings) -> None:
         await asyncio.sleep(interval)
         try:
             deleted = await purge_expired_sessions(
-                settings.db_path, settings.session_ttl
+                settings.db_path, settings.session_ttl, settings.session_ttl_grace
             )
             if deleted:
                 logger.info("expired sessions purged", count=deleted)
@@ -84,7 +84,9 @@ async def lifespan(app: FastAPI):
     # Session expiry: purge once at startup, then sweep in the background.
     ttl_task: asyncio.Task[None] | None = None
     if settings.session_ttl > 0:
-        deleted = await purge_expired_sessions(settings.db_path, settings.session_ttl)
+        deleted = await purge_expired_sessions(
+            settings.db_path, settings.session_ttl, settings.session_ttl_grace
+        )
         if deleted:
             logger.info("expired sessions purged at startup", count=deleted)
         ttl_task = asyncio.create_task(_session_ttl_sweeper(settings))
@@ -313,13 +315,28 @@ async def chat_completions(
         raw_request.headers
     )
     client_headers = raw_request.headers
-    llm_url = _effective_llm_url(settings, raw_request.headers)
+    try:
+        llm_url = _effective_llm_url(settings, raw_request.headers)
+    except HTTPException:
+        # A rejected X-PCM-LLM-URL override exits before the pipeline; emit the
+        # promised per-request timing event (once) before propagating.
+        timings.log_timing(
+            session_id_hint=client_session_value or "new",
+            stream=bool(request.stream),
+            error=True,
+        )
+        raise
 
     # Lock on a deterministic identity available before any DB work, so two
     # concurrent requests for the same conversation cannot create two sessions.
+    # The answered-message hash is authoritative (the client header is only a
+    # hint and may be absent or rotated), so all representations of the same
+    # conversation — headerless, stale header, or new header — share one lock.
     prefix_user_hash = compute_prefix_user_hash(request.messages)
-    lock_key = client_session_value or (
-        f"h:{prefix_user_hash or compute_user_hash(request.messages)}"
+    lock_key = (
+        f"h:{prefix_user_hash}"
+        if prefix_user_hash
+        else client_session_value or f"h:{compute_user_hash(request.messages)}"
     )
 
     logger.info(
@@ -445,8 +462,19 @@ async def llm_proxy(
     endpoint and returns the response unchanged.  The LLM API key is injected
     if configured.
     """
-    llm_url = _effective_llm_url(settings, raw_request.headers)
     timings = RequestTimings()
+    try:
+        llm_url = _effective_llm_url(settings, raw_request.headers)
+    except HTTPException:
+        # The override is resolved (and can be rejected) before the proxy runs;
+        # emit the per-request timing event (once) before propagating.
+        timings.log_timing(
+            method=raw_request.method,
+            path=f"/{path}",
+            stream=False,
+            error=True,
+        )
+        raise
     target_url = f"{llm_url.rstrip('/')}/{path}"
     if raw_request.url.query:
         target_url = f"{target_url}?{raw_request.url.query}"

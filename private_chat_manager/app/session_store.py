@@ -141,15 +141,21 @@ async def ensure_schema(db_path: str) -> None:
         await conn.commit()
 
 
-async def purge_expired_sessions(db_path: str, ttl_seconds: int) -> int:
-    """Delete sessions idle for longer than *ttl_seconds*.
+async def purge_expired_sessions(
+    db_path: str, ttl_seconds: int, grace_seconds: int = 0
+) -> int:
+    """Delete sessions idle for longer than ``ttl_seconds + grace_seconds``.
 
-    The TTL is a sliding window measured from ``updated_at``.  Returns the
-    number of rows deleted; a non-positive *ttl_seconds* disables expiry.
+    The TTL is a sliding window measured from ``updated_at``.  *grace_seconds*
+    is an extra margin before physical deletion: a session is touched when it is
+    resolved, but a long redaction/upstream/stream can still outlive the TTL, so
+    the margin protects an in-flight session's row (and its ``session_hashes``
+    history) from being swept mid-request.  Returns the number of rows deleted;
+    a non-positive *ttl_seconds* disables expiry.
     """
     if ttl_seconds <= 0:
         return 0
-    cutoff = time.time() - ttl_seconds
+    cutoff = time.time() - ttl_seconds - max(grace_seconds, 0)
     async with aiosqlite.connect(db_path) as conn:
         await conn.execute("PRAGMA journal_mode=WAL")
         cursor = await conn.execute(
@@ -163,6 +169,23 @@ async def purge_expired_sessions(db_path: str, ttl_seconds: int) -> int:
         )
         await conn.commit()
     return max(deleted, 0)
+
+
+async def touch_session(
+    conn: aiosqlite.Connection, session_id: str, updated_at: float
+) -> None:
+    """Bump ``updated_at`` for an existing session without rewriting its state.
+
+    Called when a session is resolved, before the (potentially long) redaction
+    and upstream work.  This keeps the row's TTL fresh so the background sweeper
+    cannot delete an in-flight session's row (and its ``session_hashes``
+    history) while the request is still using it.
+    """
+    await conn.execute(
+        "UPDATE sessions SET updated_at = ? WHERE session_id = ?",
+        (updated_at, session_id),
+    )
+    await conn.commit()
 
 
 async def get_session(

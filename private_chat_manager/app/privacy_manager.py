@@ -26,6 +26,7 @@ from .session_store import (
     find_sessions_by_historical_user_hash,
     find_sessions_by_user_hash,
     save_session,
+    touch_session,
 )
 from .streaming import StreamResponseFilter
 from .timing import RequestTimings
@@ -639,6 +640,10 @@ async def resolve_session(
         ):
             # Client rotated its id (e.g. a sub-agent); keep the binding.
             session.client_x_session_header = client_value
+        # Refresh the TTL before the potentially long redaction/upstream work so
+        # the sweeper cannot delete this in-flight session's row and history.
+        session.updated_at = time.time()
+        await touch_session(conn, session.session_id, session.updated_at)
         return session
 
     session = _new_session(
