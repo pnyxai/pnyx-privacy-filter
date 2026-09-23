@@ -4,10 +4,61 @@ from typing import Any
 from pydantic import field_validator
 from pydantic_settings import BaseSettings, SettingsConfigDict
 
+from .endpoints import normalize_llm_url
 from .streaming import DEFAULT_PLACEHOLDER_LABELS
 
-# Roles filtered by default when PCM_FILTERABLE_ROLES is not set.
-_DEFAULT_FILTERABLE_ROLES: frozenset[str] = frozenset({"user", "tool", "function"})
+# Roles/fields are redacted by default (default-deny).  The pass-through
+# settings below are the only way to opt a role or message field out; both
+# default to empty.
+def _parse_name_set(v: Any) -> frozenset[str]:
+    """Parse a comma-separated (or iterable) list of lowercased names."""
+    if isinstance(v, str):
+        return frozenset(name.strip().lower() for name in v.split(",") if name.strip())
+    if isinstance(v, (list, tuple, set, frozenset)):
+        return frozenset(str(name).strip().lower() for name in v if str(name).strip())
+    return frozenset()
+
+# Duration units accepted by the session-TTL settings (seconds per unit).
+_DURATION_UNITS = {"s": 1, "m": 60, "h": 3600, "d": 86400, "w": 604800}
+# A non-negative number (digit before any dot) followed by a single unit.
+_DURATION_RE = re.compile(r"^\s*(\d+(?:\.\d+)?)\s*([smhdw])\s*$", re.IGNORECASE)
+
+
+def parse_duration(value: Any, *, setting: str) -> int:
+    """Parse a human duration like ``30s``/``360m``/``6h``/``1.5d``/``2w``.
+
+    Units: ``s`` seconds, ``m`` minutes, ``h`` hours, ``d`` days, ``w`` weeks.
+    The number may be an integer or a float (e.g. ``1.5d`` = 1.5 days) and must
+    have a digit before any dot.  Empty/``None``/``0`` disable the feature
+    (``0``).  Any other shape raises :class:`ValueError` so misconfiguration
+    fails fast.
+    """
+    if value is None:
+        return 0
+    if isinstance(value, bool):
+        raise ValueError(f"{setting} must be a duration, not a boolean")
+    if isinstance(value, (int, float)):
+        if value < 0:
+            raise ValueError(f"{setting} must not be negative")
+        return int(round(float(value)))
+
+    text = str(value).strip()
+    if not text:
+        return 0
+    try:
+        if float(text) == 0:
+            return 0
+    except ValueError:
+        pass
+
+    match = _DURATION_RE.match(text)
+    if not match:
+        raise ValueError(
+            f"{setting} must be a duration like '30s', '360m', '6h', '1.5d' or '2w' "
+            f"(units: s=seconds, m=minutes, h=hours, d=days, w=weeks); got {value!r}"
+        )
+    amount = float(match.group(1))
+    return int(round(amount * _DURATION_UNITS[match.group(2).lower()]))
 
 
 class Settings(BaseSettings):
@@ -32,16 +83,26 @@ class Settings(BaseSettings):
     @field_validator("llm_url", mode="after")
     @classmethod
     def _normalize_llm_url(cls, v: str) -> str:
-        """Normalise the downstream base URL.
+        """Normalise the downstream base URL (strip trailing slash and ``/v1``)."""
+        return normalize_llm_url(v)
 
-        PCM always appends ``/v1/...`` itself, so a base that already ends in
-        ``/v1`` (a common user mistake) is de-duplicated here.  Trailing
-        slashes are stripped so the join never produces ``//``.
-        """
-        url = v.strip().rstrip("/")
-        if url.lower().endswith("/v1"):
-            url = url[:-3].rstrip("/")
-        return url
+    # Optional allowlist of *additional* downstream LLM base URLs a request may
+    # select via the ``X-PCM-LLM-URL`` header (comma-separated).  Empty disables
+    # the override entirely (the header is ignored).  Intended as a testing aid
+    # so several engines can be exercised without restarting PCM; the allowlist
+    # is the security boundary against arbitrary (SSRF) targets.
+    llm_url_allowlist: Any = frozenset()
+
+    @field_validator("llm_url_allowlist", mode="before")
+    @classmethod
+    def _parse_llm_url_allowlist(cls, v: Any) -> frozenset[str]:
+        if isinstance(v, str):
+            raw = [url for url in v.split(",") if url.strip()]
+        elif isinstance(v, (list, tuple, set, frozenset)):
+            raw = [str(url) for url in v if str(url).strip()]
+        else:
+            return frozenset()
+        return frozenset(n for n in (normalize_llm_url(url) for url in raw) if n)
 
     @field_validator("llm_session_header", mode="before")
     @classmethod
@@ -62,6 +123,36 @@ class Settings(BaseSettings):
     # Embedded session database
     db_path: str = "./sessions.db"
 
+    # Session time-to-live, counted from the last activity (``updated_at``). A
+    # duration like "360m", "6h", "1.5d" or "2w" (m/h/d/w = minutes/hours/days/
+    # weeks; integer or float). Empty/0 disables expiry (the default).
+    session_ttl: int = 0
+
+    @field_validator("session_ttl", mode="before")
+    @classmethod
+    def _parse_session_ttl(cls, v: Any) -> int:
+        return parse_duration(v, setting="PCM_SESSION_TTL")
+
+    # Grace added to the TTL before the background sweeper physically deletes a
+    # session.  `updated_at` is refreshed when a session is resolved, but a very
+    # long redaction/upstream/stream can still outlive the TTL; this margin
+    # keeps the sweeper from deleting an in-flight session's row and history.
+    session_ttl_grace: int = 120
+
+    @field_validator("session_ttl_grace", mode="before")
+    @classmethod
+    def _parse_session_ttl_grace(cls, v: Any) -> int:
+        return parse_duration(v, setting="PCM_SESSION_TTL_GRACE")
+
+    # How often the background sweeper purges expired sessions (same duration
+    # syntax). Only used when PCM_SESSION_TTL is enabled.
+    session_ttl_sweep: int = 600
+
+    @field_validator("session_ttl_sweep", mode="before")
+    @classmethod
+    def _parse_session_ttl_sweep(cls, v: Any) -> int:
+        return parse_duration(v, setting="PCM_SESSION_TTL_SWEEP")
+
     # Uvicorn bind settings (used by the startup script / Docker CMD)
     host: str = "0.0.0.0"
     port: int = 8080
@@ -69,19 +160,30 @@ class Settings(BaseSettings):
     # Logging
     log_level: str = "INFO"
 
-    # Comma-separated list of message roles whose content is sent through the
-    # Triton privacy filter before being stored in the hidden session history.
-    filterable_roles: Any = _DEFAULT_FILTERABLE_ROLES
+    # ------------------------------------------------------------------
+    # Privacy filtering scope (default-deny).
+    #
+    # Client-supplied history is untrusted: every message role and every known
+    # text field is redacted unless explicitly listed here as a pass-through.
+    # Fresh conversations (cursor == 0) use the *_FRESH sets, which do NOT
+    # inherit the resumed sets, so loosening the resumed policy cannot leak PII
+    # from a replayed conversation.  Retired: PCM_FILTERABLE_ROLES.
+    # ------------------------------------------------------------------
+    passthrough_roles: Any = frozenset()
+    passthrough_roles_fresh: Any = frozenset()
+    passthrough_fields: Any = frozenset()
+    passthrough_fields_fresh: Any = frozenset()
 
-    @field_validator("filterable_roles", mode="before")
+    @field_validator(
+        "passthrough_roles",
+        "passthrough_roles_fresh",
+        "passthrough_fields",
+        "passthrough_fields_fresh",
+        mode="before",
+    )
     @classmethod
-    def _parse_filterable_roles(cls, v: Any) -> frozenset[str]:
-        if isinstance(v, str):
-            roles = frozenset(r.strip().lower() for r in v.split(",") if r.strip())
-            return roles if roles else _DEFAULT_FILTERABLE_ROLES
-        if isinstance(v, (list, tuple, set, frozenset)):
-            return frozenset(str(r).strip().lower() for r in v if str(r).strip())
-        return _DEFAULT_FILTERABLE_ROLES
+    def _parse_passthrough(cls, v: Any) -> frozenset[str]:
+        return _parse_name_set(v)
 
     # Labels used by the streaming de-anonymiser to recognise placeholder tags.
     # They must match the labels emitted by the privacy-filter (after the

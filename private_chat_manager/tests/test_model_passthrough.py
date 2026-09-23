@@ -99,7 +99,7 @@ async def test_session_header_is_forwarded_and_used_as_session_id(make_client):
 
     assert response.status_code == 200
     session_id = response.headers["x-session-id"]
-    assert session_id.startswith("sess-abc::")
+    assert session_id == "sess-abc"
     assert last_headers(route).get("x-opencode-session") == session_id
 
 
@@ -122,7 +122,7 @@ async def test_specific_session_header_beats_x_session_id(make_client):
 
     assert response.status_code == 200
     session_id = response.headers["x-session-id"]
-    assert session_id.startswith("affinity::")
+    assert session_id == "affinity"
     assert last_headers(route).get("x-opencode-session") == session_id
 
 
@@ -145,6 +145,22 @@ async def test_custom_client_headers_are_forwarded(client):
     # (The strip-list itself is covered by the build_forward_headers unit
     # tests; httpx re-adds its own Connection/Accept-Encoding when sending.)
     assert last_headers(route).get("x-custom-trace") == "trace-1"
+
+
+@pytest.mark.asyncio
+@respx.mock
+async def test_client_session_header_name_is_preserved_in_response(client):
+    respx.post(LLM_URL).mock(return_value=httpx.Response(200, json=completion()))
+    response = await client.post(
+        "/v1/chat/completions",
+        json={"model": "m", "messages": [{"role": "user", "content": "hi"}]},
+        headers={"x-session-affinity": "aff-1"},
+    )
+
+    assert response.status_code == 200
+    # The client's own header name is echoed back alongside X-Session-ID.
+    assert response.headers["x-session-affinity"] == "aff-1"
+    assert response.headers["x-session-id"] == "aff-1"
 
 
 @pytest.mark.asyncio

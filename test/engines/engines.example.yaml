@@ -1,0 +1,29 @@
+# Live-test configuration for test/engines/test.py
+#
+# Copy this file to `engines.yaml` (same directory) and adjust to your setup.
+# `engines.yaml` is gitignored, so each operator defines their own endpoints.
+#
+# `model` is optional: when omitted, the first id returned by the engine's
+# `/v1/models` is used. Set it to pin a specific model.
+#
+# `pcm_url` is optional: the URL PCM (inside its container) uses to reach the
+# engine, sent in the X-PCM-LLM-URL header with `--via-override`. It defaults to
+# `base_url`; set it when PCM runs in Docker and the engine is on the host
+# (use `http://host.docker.internal:<port>`). It must also appear in
+# PCM_LLM_URL_ALLOWLIST.
+
+# The PrivateChatManager instance under test.
+pcm:
+  url: http://localhost:8080
+
+# Downstream OpenAI-compatible engines to validate.
+engines:
+  llama_cpp:
+    base_url: http://localhost:10080
+    pcm_url: http://host.docker.internal:10080
+    # model: llama.cpp        # optional; omit to auto-detect from /v1/models
+
+  vllm:
+    base_url: http://localhost:9087
+    pcm_url: http://host.docker.internal:9087
+    # model: vllm    # optional; omit to auto-detect from /v1/models

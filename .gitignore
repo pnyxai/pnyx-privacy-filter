@@ -8,3 +8,6 @@ build/
 .pytest_cache/
 .coverage
 htmlcov/
+
+# User-owned live-test configuration (copy from the matching .example file).
+test/engines/engines.yaml

@@ -75,7 +75,6 @@ def settings(tmp_path) -> Settings:
         triton_url="triton:8000",
         triton_model_name="ensemble_model",
         db_path=str(tmp_path / "sessions.db"),
-        filterable_roles=frozenset({"user", "tool", "function"}),
     )
 
 

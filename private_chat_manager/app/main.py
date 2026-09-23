@@ -1,6 +1,7 @@
 from __future__ import annotations
 
-from contextlib import asynccontextmanager
+import asyncio
+from contextlib import asynccontextmanager, suppress
 from typing import Any
 
 import httpx
@@ -10,21 +11,29 @@ from fastapi.responses import JSONResponse, Response, StreamingResponse
 
 from ._logging import configure_logging, get_logger
 from .config import Settings
+from .endpoints import requested_llm_url, resolve_llm_url
 from .headers import (
     build_forward_headers,
     build_response_headers,
-    resolve_session_label,
+    resolve_session_header,
 )
 from .models import PrivateChatRequest, SessionInspectResponse
 from .privacy_manager import (
+    compute_prefix_user_hash,
+    compute_user_hash,
     handle_request,
     handle_stream_request,
     prepare_request,
-    resolve_session_key,
 )
 from .session_lock import get_session_lock
-from .session_store import ensure_schema, find_sessions_by_base, get_session
+from .session_store import (
+    ensure_schema,
+    find_sessions_by_client_header,
+    get_session,
+    purge_expired_sessions,
+)
 from .triton_client import TritonPrivacyFilterClient
+from .timing import RequestTimings
 
 logger = get_logger(__name__)
 
@@ -32,6 +41,22 @@ logger = get_logger(__name__)
 # ---------------------------------------------------------------------------
 # Application lifespan: initialise shared resources once at startup
 # ---------------------------------------------------------------------------
+
+
+async def _session_ttl_sweeper(settings: Settings) -> None:
+    """Background task: periodically purge sessions idle past the TTL."""
+    # Guard against a zero/negative sweep interval (which would busy-loop).
+    interval = settings.session_ttl_sweep if settings.session_ttl_sweep > 0 else 600
+    while True:
+        await asyncio.sleep(interval)
+        try:
+            deleted = await purge_expired_sessions(
+                settings.db_path, settings.session_ttl, settings.session_ttl_grace
+            )
+            if deleted:
+                logger.info("expired sessions purged", count=deleted)
+        except Exception:
+            logger.exception("session TTL sweep failed")
 
 
 @asynccontextmanager
@@ -56,8 +81,29 @@ async def lifespan(app: FastAPI):
         triton_max_chars=settings.triton_max_chars,
     )
 
-    yield
-    # No explicit cleanup needed: SQLite connections are opened per-request.
+    # Session expiry: purge once at startup, then sweep in the background.
+    ttl_task: asyncio.Task[None] | None = None
+    if settings.session_ttl > 0:
+        deleted = await purge_expired_sessions(
+            settings.db_path, settings.session_ttl, settings.session_ttl_grace
+        )
+        if deleted:
+            logger.info("expired sessions purged at startup", count=deleted)
+        ttl_task = asyncio.create_task(_session_ttl_sweeper(settings))
+        logger.info(
+            "session TTL enabled",
+            ttl_seconds=settings.session_ttl,
+            sweep_interval_seconds=settings.session_ttl_sweep,
+        )
+
+    try:
+        yield
+    finally:
+        if ttl_task is not None:
+            ttl_task.cancel()
+            with suppress(asyncio.CancelledError):
+                await ttl_task
+    # No other cleanup needed: SQLite connections are opened per-request.
 
 
 # ---------------------------------------------------------------------------
@@ -103,6 +149,38 @@ def get_settings(request: Request) -> Settings:
 
 def get_triton_client(request: Request) -> TritonPrivacyFilterClient:
     return request.app.state.triton_client
+
+
+def _session_response_headers(
+    client_header_name: str | None, client_x_session_id: str
+) -> dict[str, str]:
+    """Response headers carrying the client-facing session id.
+
+    ``X-Session-ID`` is always emitted; when the client used a *different*
+    session header name, the id is also echoed under that name so the client's
+    own convention is preserved.
+    """
+    headers = {"X-Session-ID": client_x_session_id}
+    if client_header_name and client_header_name.lower() != "x-session-id":
+        headers[client_header_name] = client_x_session_id
+    return headers
+
+
+def _effective_llm_url(settings: Settings, headers) -> str:
+    """Return the downstream URL for this request.
+
+    Honours the ``X-PCM-LLM-URL`` header only when ``PCM_LLM_URL_ALLOWLIST`` is
+    configured and contains the (normalised) URL; otherwise the header is
+    ignored.  An allowlisted-but-unlisted URL is rejected with 403.
+    """
+    try:
+        return resolve_llm_url(
+            settings.llm_url,
+            settings.llm_url_allowlist,
+            requested_llm_url(headers),
+        )
+    except ValueError as exc:
+        raise HTTPException(status_code=403, detail=str(exc)) from exc
 
 
 # ---------------------------------------------------------------------------
@@ -158,11 +236,10 @@ async def inspect_session(
         await conn.execute("PRAGMA journal_mode=WAL")
         session = await get_session(conn, session_id)
         if session is None:
-            # Internal keys are "<client-id>::<fingerprint>"; resolve a
-            # client-facing id to its conversation(s) and pick the main one.
-            candidates = await find_sessions_by_base(conn, session_id)
+            # Fall back to resolving by the client-facing session id and pick
+            # the most recently active conversation.
+            candidates = await find_sessions_by_client_header(conn, session_id)
             if candidates:
-                # Prefer the most recently active conversation.
                 session = max(candidates, key=lambda s: s.updated_at)
 
     if session is None:
@@ -189,6 +266,12 @@ async def inspect_session(
         raw_messages=session.raw_messages,
         hidden_messages=session.hidden_messages,
         privacy_state=session.privacy_state,
+        client_x_session_header=session.client_x_session_header,
+        endpoint_x_session_header=session.endpoint_x_session_header,
+        user_hash=session.user_hash,
+        parent_session_id=session.parent_session_id,
+        root_session_id=session.root_session_id,
+        origin_message_count=session.origin_message_count,
         turn_count=turn_count,
         filtered_turn_count=filtered_turn_count,
     )
@@ -211,36 +294,61 @@ async def chat_completions(
       Placeholders from *previous* turns in the session are still
       de-anonymised in the response.
 
-    The session is identified by any client header matching ``x…session…``
+    The session is recovered from the message history itself (a Merkle hash of
+    the answered user messages) with any client header matching ``x…session…``
     (e.g. ``X-Session-ID``, ``x-opencode-session``, ``x-session-affinity``,
-    ``X-Hermes-Session-Id``), falling back to a new UUID.  The id is then
-    namespaced per conversation (see :func:`resolve_session_key`) so that
-    distinct logical conversations sharing one client session id — such as an
-    agent's title generator and its main chat — do not corrupt each other.
-    Requests for one conversation are serialised.  All client headers (minus
-    hop-by-hop/technical ones) are forwarded to the downstream LLM, and the
-    resolved session id can additionally be re-emitted under
-    ``PCM_LLM_SESSION_HEADER`` for gateways that require it.
+    ``X-Hermes-Session-Id``) used only as a hint — see
+    :func:`~app.privacy_manager.resolve_session`.  Requests for one
+    conversation are serialised.  All client headers (minus hop-by-hop/technical
+    ones) are forwarded to the downstream LLM, and the endpoint session id PCM
+    derives for the upstream is emitted under the endpoint's session header
+    (e.g. ``x-opencode-session``), overriding any client-supplied value.
 
     Both buffered (``stream=false``) and streaming (``stream=true``) modes are
     supported.  Streaming returns ``text/event-stream`` SSE frames whose
-    deltas have been de-anonymised in real time; the resolved session ID is
-    always returned in the ``X-Session-ID`` response header.
+    deltas have been de-anonymised in real time; the resolved client session ID
+    is always returned in ``X-Session-ID`` and, when the client used a
+    different session header name, echoed under that name too.
     """
-    base_session_id = resolve_session_label(raw_request.headers)
+    timings = RequestTimings()
+    client_session_header_name, client_session_value = resolve_session_header(
+        raw_request.headers
+    )
     client_headers = raw_request.headers
-    session_key = resolve_session_key(base_session_id, request.messages)
+    try:
+        llm_url = _effective_llm_url(settings, raw_request.headers)
+    except HTTPException:
+        # A rejected X-PCM-LLM-URL override exits before the pipeline; emit the
+        # promised per-request timing event (once) before propagating.
+        timings.log_timing(
+            session_id_hint=client_session_value or "new",
+            stream=bool(request.stream),
+            error=True,
+        )
+        raise
+
+    # Lock on a deterministic identity available before any DB work, so two
+    # concurrent requests for the same conversation cannot create two sessions.
+    # The answered-message hash is authoritative (the client header is only a
+    # hint and may be absent or rotated), so all representations of the same
+    # conversation — headerless, stale header, or new header — share one lock.
+    prefix_user_hash = compute_prefix_user_hash(request.messages)
+    lock_key = (
+        f"h:{prefix_user_hash}"
+        if prefix_user_hash
+        else client_session_value or f"h:{compute_user_hash(request.messages)}"
+    )
 
     logger.info(
         "chat completion request",
-        session_id_hint=base_session_id or "new",
-        session_key=session_key,
+        session_id_hint=client_session_value or "new",
+        lock_key=lock_key,
         msg_count=len(request.messages),
         bypass=request.bypass_privacy_filter,
         stream=bool(request.stream),
     )
 
-    lock = get_session_lock(session_key)
+    lock = get_session_lock(lock_key)
 
     if request.stream:
         # Hold the lock across the whole stream: the session is persisted when
@@ -251,13 +359,22 @@ async def chat_completions(
                 await conn.execute("PRAGMA journal_mode=WAL")
                 prepared = await prepare_request(
                     request=request,
-                    session_id_header=session_key,
+                    client_session_value=client_session_value,
                     settings=settings,
                     triton_client=triton_client,
                     conn=conn,
                     client_headers=client_headers,
+                    llm_url=llm_url,
+                    timings=timings,
                 )
         except BaseException:
+            # A failure before the stream exists has no _finish() to emit
+            # timing; emit the fallback here (once) before releasing.
+            timings.log_timing(
+                session_id_hint=client_session_value or "new",
+                stream=True,
+                error=True,
+            )
             lock.release()
             raise
 
@@ -276,31 +393,53 @@ async def chat_completions(
             _locked_stream(),
             media_type="text/event-stream",
             headers={
-                "X-Session-ID": prepared.session_id,
+                **_session_response_headers(
+                    client_session_header_name,
+                    prepared.client_x_session_header or prepared.session_id,
+                ),
                 "Cache-Control": "no-cache",
                 "Connection": "keep-alive",
                 "X-Accel-Buffering": "no",
             },
         )
 
-    async with lock:
-        async with aiosqlite.connect(settings.db_path) as conn:
-            await conn.execute("PRAGMA journal_mode=WAL")
-            response_data, session_id = await handle_request(
-                request=request,
-                session_id_header=session_key,
-                settings=settings,
-                triton_client=triton_client,
-                conn=conn,
-                client_headers=client_headers,
-            )
+    try:
+        async with lock:
+            async with aiosqlite.connect(settings.db_path) as conn:
+                await conn.execute("PRAGMA journal_mode=WAL")
+                response_data, client_x_session_id = await handle_request(
+                    request=request,
+                    client_session_value=client_session_value,
+                    settings=settings,
+                    triton_client=triton_client,
+                    conn=conn,
+                    client_headers=client_headers,
+                    llm_url=llm_url,
+                    timings=timings,
+                )
+    except BaseException:
+        # Validation, Triton, upstream, parsing or persistence failures leave
+        # handle_request before its success-path timing; emit the fallback so
+        # every request is accounted for exactly once.
+        timings.log_timing(
+            session_id_hint=client_session_value or "new",
+            stream=False,
+            error=True,
+        )
+        raise
 
-    logger.info("chat completion response sent", session_id=session_id)
+    logger.info("chat completion response sent", session_id=client_x_session_id)
     if "response_body" in settings.verbose_log_events:
-        logger.debug("chat completion response body", session_id=session_id, response=response_data)
+        logger.debug(
+            "chat completion response body",
+            session_id=client_x_session_id,
+            response=response_data,
+        )
     return JSONResponse(
         content=response_data,
-        headers={"X-Session-ID": session_id},
+        headers=_session_response_headers(
+            client_session_header_name, client_x_session_id or ""
+        ),
     )
 
 
@@ -323,7 +462,20 @@ async def llm_proxy(
     endpoint and returns the response unchanged.  The LLM API key is injected
     if configured.
     """
-    target_url = f"{settings.llm_url.rstrip('/')}/{path}"
+    timings = RequestTimings()
+    try:
+        llm_url = _effective_llm_url(settings, raw_request.headers)
+    except HTTPException:
+        # The override is resolved (and can be rejected) before the proxy runs;
+        # emit the per-request timing event (once) before propagating.
+        timings.log_timing(
+            method=raw_request.method,
+            path=f"/{path}",
+            stream=False,
+            error=True,
+        )
+        raise
+    target_url = f"{llm_url.rstrip('/')}/{path}"
     if raw_request.url.query:
         target_url = f"{target_url}?{raw_request.url.query}"
 
@@ -345,23 +497,41 @@ async def llm_proxy(
         target=target_url,
     )
 
-    async with httpx.AsyncClient(timeout=120.0) as client:
-        llm_resp = await client.request(
+    try:
+        async with httpx.AsyncClient(timeout=120.0) as client:
+            llm_resp = await client.request(
+                method=raw_request.method,
+                url=target_url,
+                headers=forward_headers,
+                content=body,
+            )
+
+        # Strip headers that no longer describe the (decoded) response body.
+        response_headers = build_response_headers(llm_resp.headers)
+        timings.mark("upstream")
+
+        logger.info(
+            "proxy passthrough response",
             method=raw_request.method,
-            url=target_url,
-            headers=forward_headers,
-            content=body,
+            path=f"/{path}",
+            status_code=llm_resp.status_code,
         )
-
-    # Strip headers that no longer describe the (decoded) response body.
-    response_headers = build_response_headers(llm_resp.headers)
-
-    logger.info(
-        "proxy passthrough response",
-        method=raw_request.method,
-        path=f"/{path}",
-        status_code=llm_resp.status_code,
-    )
+        timings.mark("finalize")
+        timings.log_timing(
+            method=raw_request.method,
+            path=f"/{path}",
+            stream=False,
+        )
+    except httpx.HTTPError:
+        # Transport/status failures skip the success-path timing; account for
+        # them (once) before propagating.
+        timings.log_timing(
+            method=raw_request.method,
+            path=f"/{path}",
+            stream=False,
+            error=True,
+        )
+        raise
 
     return Response(
         content=llm_resp.content,

@@ -159,6 +159,21 @@ class SessionData(BaseModel):
     # Hidden (redacted) messages — what the LLM actually receives
     hidden_messages: list[dict[str, Any]] = Field(default_factory=list)
     privacy_state: PrivacyFilterState = Field(default_factory=PrivacyFilterState)
+    # Session id in the client-facing namespace: the value the client sent, or
+    # the id PCM assigned and returned via ``X-Session-ID`` when it sent none.
+    client_x_session_header: str | None = None
+    # Session id in the upstream endpoint namespace: the value PCM sends under
+    # the endpoint's session header (``None`` when the endpoint needs none).
+    endpoint_x_session_header: str | None = None
+    # Merkle root over the *answered* user messages; updated after each turn so
+    # the conversation can be recovered without relying on client headers.
+    user_hash: str | None = None
+    # Lineage (git-like): the session this one was forked from, the shared root
+    # of the whole conversation tree, and how many messages were inherited at
+    # the fork point.  A first session is its own root.
+    parent_session_id: str | None = None
+    root_session_id: str | None = None
+    origin_message_count: int | None = None
 
 
 class SessionInspectResponse(BaseModel):
@@ -170,6 +185,13 @@ class SessionInspectResponse(BaseModel):
     raw_messages: list[dict[str, Any]]
     hidden_messages: list[dict[str, Any]]
     privacy_state: PrivacyFilterState
+    # Lineage (git-like): parent/root session ids and the fork point.
+    client_x_session_header: str | None = None
+    endpoint_x_session_header: str | None = None
+    user_hash: str | None = None
+    parent_session_id: str | None = None
+    root_session_id: str | None = None
+    origin_message_count: int | None = None
     # Convenience counters
     turn_count: int
     """Number of complete request/response cycles stored for this session."""
