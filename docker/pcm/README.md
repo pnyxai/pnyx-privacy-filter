@@ -30,15 +30,21 @@ All variables use the `PCM_` prefix.
 | `PCM_LLM_URL` | **yes** | — | Base URL of the downstream LLM, e.g. `http://vllm:8000`. PCM appends `/v1/…` itself; a trailing `/v1` is stripped automatically |
 | `PCM_LLM_MODEL_NAME` | no | `""` | Fallback model used only when the client omits `model`, e.g. `meta-llama/Llama-3-8B-Instruct`. The client-supplied model always wins |
 | `PCM_LLM_API_KEY` | no | `""` | Bearer token for the LLM endpoint (leave empty if not required) |
-| `PCM_LLM_SESSION_HEADER` | no | auto | Upstream session header. Auto-defaults to `x-opencode-session` when `PCM_LLM_URL` host is `opencode.ai`; set explicitly for others |
+| `PCM_LLM_SESSION_HEADER` | no | auto | Upstream session header. Resolved by the endpoint registry (`app/endpoints.py`): built-in rule maps an `opencode.ai` host to `x-opencode-session`; set explicitly to override for other endpoints. PCM derives the endpoint session id and emits it under this name, overriding any client value |
+| `PCM_LLM_URL_ALLOWLIST` | no | `""` | Base URLs a request may select for one call via the `X-PCM-LLM-URL` header (testing aid; empty disables). Stripped before forwarding upstream |
 | `PCM_TRITON_URL` | no | `localhost:8000` | Host and port of the Triton inference server |
 | `PCM_TRITON_MODEL_NAME` | no | `ensemble_model` | Triton model name to call for privacy filtering |
 | `PCM_TRITON_MAX_CHARS` | no | `8000` | Max characters per Triton call; longer messages are split at natural boundaries and redacted chunk by chunk |
 | `PCM_DB_PATH` | no | `./sessions.db` | Path inside the container for the SQLite session database |
+| `PCM_SESSION_TTL` | no | `0` (disabled) | Session time-to-live from last activity; duration with `s`/`m`/`h`/`d`/`w` units, integer or float (e.g. `30s`, `360m`, `6h`, `1.5d`, `2w`). Empty/`0` disables |
+| `PCM_SESSION_TTL_SWEEP` | no | `10m` | Background purge interval (same syntax); used only when `PCM_SESSION_TTL` is enabled |
 | `PCM_HOST` | no | `0.0.0.0` | Bind address for the uvicorn server |
 | `PCM_PORT` | no | `8080` | Bind port for the uvicorn server |
 | `PCM_LOG_LEVEL` | no | `INFO` | Log verbosity: `DEBUG` \| `INFO` \| `WARNING` \| `ERROR` |
-| `PCM_FILTERABLE_ROLES` | no | `user,tool,function` | Comma-separated message roles sent through Triton |
+| `PCM_PASSTHROUGH_ROLES` | no | `""` | Roles to skip redaction on resumed sessions (default: redact all) |
+| `PCM_PASSTHROUGH_ROLES_FRESH` | no | `""` | Roles to skip on fresh conversations; does not inherit the resumed list |
+| `PCM_PASSTHROUGH_FIELDS` | no | `""` | Message text fields to skip on resumed sessions |
+| `PCM_PASSTHROUGH_FIELDS_FRESH` | no | `""` | Message text fields to skip on fresh conversations |
 | `PCM_VERBOSE_LOG_EVENTS` | no | `""` | Comma-separated debug event names (see the PCM README) |
 | `PCM_PLACEHOLDER_LABELS` | no | the 8 privacy-filter labels | Comma-separated labels the streaming de-anonymiser recognises as placeholder tags |
 | `PCM_SYSTEM_PROMPT_PII_INSTRUCTION` | no | `""` | Text appended to the system prompt explaining how to handle placeholder tags |
@@ -100,15 +106,17 @@ docker run -d \
 | Method | Path | Description |
 |---|---|---|
 | `POST` | `/v1/chat/completions` | Privacy-aware chat completions (OpenAI-compatible + `bypass_privacy_filter` field and `X-Session-ID` header) |
-| `GET` | `/v1/sessions/{session_id}` | Inspect raw messages, hidden messages, and privacy state for a session |
+| `GET` | `/v1/sessions/{session_id}` | Inspect raw messages, hidden messages, privacy state, identity and lineage for a session |
 | `GET` | `/health` | Liveness probe |
 | `GET` | `/health/triton` | Readiness probe — checks that the Triton model is ready |
 
 Both buffered (`stream: false`) and streaming (`stream: true`) responses are
 supported. Streaming returns `text/event-stream` SSE frames whose
 `content`/`reasoning`/tool-call deltas are de-anonymised in real time. The
-resolved session ID is returned in the `X-Session-ID` response header; send it
-back on the next request to continue the same session.
+client-facing session ID is returned in the `X-Session-ID` response header
+(and echoed under the client's own session header name when it used a
+different one); send it back on the next request to continue the same session
+(the message history is the source of truth, so the id is only a hint).
 
 ## Quick test
 

@@ -6,44 +6,25 @@ and its model backend.  Two concerns are handled here:
 * **Session identity** — different agents name their session header
   differently (``X-Session-ID``, ``x-session-affinity``,
   ``x-opencode-session``, ``X-Hermes-Session-Id`` …).  Any ``x…session…``
-  header is accepted and resolved to a single session id.
+  header is accepted and resolved to a single client-facing session id.
 * **Header forwarding** — client headers are copied to the upstream LLM
   verbatim, except for hop-by-hop and protocol-managed headers that must be
-  recomputed by the HTTP client.  Optionally, the resolved session id can be
-  re-emitted under an upstream-specific header name
-  (``Settings.llm_session_header``) for gateways that require one.
+  recomputed by the HTTP client.  The endpoint-specific session header is
+  decided elsewhere (:mod:`app.endpoints`); this module only injects it.
+
+Endpoint detection and the session-header policy derived from ``PCM_LLM_URL``
+live in :mod:`app.endpoints`.
 """
 
 from __future__ import annotations
 
 import re
 from collections.abc import Mapping
-from urllib.parse import urlparse
 
 # Any header whose name starts with ``x`` and contains ``session`` is treated
 # as a session identifier (case-insensitive), e.g. ``x-opencode-session``,
 # ``x-session-affinity`` or ``X-Hermes-Session-Id``.
 SESSION_HEADER_RE = re.compile(r"^x[-_].*session", re.IGNORECASE)
-
-# Session header required by the OpenCode Zen/Go relay (opencode.ai).
-OPENCODE_SESSION_HEADER = "x-opencode-session"
-_OPENCODE_HOST = "opencode.ai"
-
-
-def is_opencode_endpoint(url: str | None) -> bool:
-    """True when *url*'s host is ``opencode.ai`` (including subdomains).
-
-    Mirrors the predicate the Hermes agent uses to decide whether to attach
-    ``x-opencode-session``; used here to default the upstream session header
-    when ``PCM_LLM_SESSION_HEADER`` is not set.
-    """
-    host = (urlparse(str(url or "")).hostname or "").lower()
-    return host == _OPENCODE_HOST or host.endswith("." + _OPENCODE_HOST)
-
-
-def default_session_header_for(url: str | None) -> str | None:
-    """Return the session header an upstream requires by convention, if any."""
-    return OPENCODE_SESSION_HEADER if is_opencode_endpoint(url) else None
 
 # Headers that must not be forwarded (hop-by-hop or host-specific).
 HOP_BY_HOP = frozenset(
@@ -60,9 +41,14 @@ HOP_BY_HOP = frozenset(
 )
 
 # Additionally dropped from *requests*: a stale ``Content-Length`` would not
-# match a re-serialised body, and a client-declared ``Accept-Encoding`` could
-# request a compression scheme the proxy cannot decode.
-REQUEST_STRIPPED = HOP_BY_HOP | {"content-length", "accept-encoding"}
+# match a re-serialised body, a client-declared ``Accept-Encoding`` could
+# request a compression scheme the proxy cannot decode, and ``X-PCM-LLM-URL``
+# is a PCM-internal control header that must not leak upstream.
+REQUEST_STRIPPED = HOP_BY_HOP | {
+    "content-length",
+    "accept-encoding",
+    "x-pcm-llm-url",
+}
 
 # Additionally dropped from *responses*: ``httpx`` transparently decodes the
 # body, so the original ``Content-Encoding``/``Content-Length`` no longer
@@ -75,24 +61,32 @@ def is_forwardable_request_header(name: str) -> bool:
     return name.lower() not in REQUEST_STRIPPED
 
 
-def resolve_session_label(headers: Mapping[str, str]) -> str | None:
-    """Return the value of the client's session header, if present.
+def resolve_session_header(
+    headers: Mapping[str, str],
+) -> tuple[str | None, str | None]:
+    """Return the ``(name, value)`` of the client's session header, if any.
 
     Any header matching :data:`SESSION_HEADER_RE` is accepted, in arrival
     order.  ``X-Session-ID`` is only a fallback: a more specific session
     header (e.g. ``x-opencode-session``, ``x-session-affinity``,
     ``X-Hermes-Session-Id``) takes precedence even when it appears later.
-    Returns ``None`` when no session header was sent.
+    Returns ``(None, None)`` when no session header was sent.  The name is
+    returned as received so callers can echo it back verbatim.
     """
-    fallback: str | None = None
+    fallback: tuple[str, str] | None = None
     for name, value in headers.items():
         if not SESSION_HEADER_RE.match(name):
             continue
         if name.lower() == "x-session-id":
-            fallback = value
+            fallback = (name, value)
             continue
-        return value
-    return fallback
+        return name, value
+    return fallback if fallback is not None else (None, None)
+
+
+def resolve_session_label(headers: Mapping[str, str]) -> str | None:
+    """Return the value of the client's session header, if present."""
+    return resolve_session_header(headers)[1]
 
 
 def build_forward_headers(
@@ -110,9 +104,10 @@ def build_forward_headers(
         api_key:        When set, overrides any client ``Authorization`` with a
                         bearer token for the configured upstream.
         session_header: Optional upstream-specific session header name.
-        session_id:     Value to emit under *session_header*.  Only written when
-                        both *session_header* and *session_id* are provided and
-                        the client did not already send that header.
+        session_id:     Value to emit under *session_header*.  PCM is
+                        authoritative for the endpoint session header: when
+                        both are provided it **overrides** any client-supplied
+                        value so a malformed id cannot leak upstream.
         force_json:     When true (chat completions), ``Content-Type`` is forced
                         to ``application/json``.  The generic proxy passes
                         ``False`` to forward the original content type.
@@ -127,7 +122,7 @@ def build_forward_headers(
     if api_key:
         forwarded["authorization"] = f"Bearer {api_key}"
     if session_header and session_id:
-        forwarded.setdefault(session_header.lower(), session_id)
+        forwarded[session_header.lower()] = session_id
 
     return forwarded
 

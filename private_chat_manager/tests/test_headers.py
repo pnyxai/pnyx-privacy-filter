@@ -7,9 +7,8 @@ import pytest
 from app.headers import (
     build_forward_headers,
     build_response_headers,
-    default_session_header_for,
-    is_opencode_endpoint,
     redact_headers,
+    resolve_session_header,
     resolve_session_label,
 )
 
@@ -29,31 +28,6 @@ def test_redact_headers_masks_sensitive_values():
     assert redacted["x-api-key"] == "<redacted>"
     assert redacted["x-opencode-session"] == "auto-123"
     assert redacted["content-type"] == "application/json"
-
-
-@pytest.mark.parametrize(
-    "url, expected",
-    [
-        ("https://opencode.ai/zen/go/v1", True),
-        ("https://opencode.ai", True),
-        ("https://api.opencode.ai/v1", True),
-        ("http://localhost:8080/v1", False),
-        ("https://evilopencode.ai/v1", False),
-        ("https://opencode.ai.evil.com/v1", False),
-        ("", False),
-        (None, False),
-    ],
-)
-def test_is_opencode_endpoint(url, expected):
-    assert is_opencode_endpoint(url) is expected
-
-
-def test_default_session_header_for():
-    assert (
-        default_session_header_for("https://opencode.ai/zen/go")
-        == "x-opencode-session"
-    )
-    assert default_session_header_for("http://localhost:8080") is None
 
 
 @pytest.mark.parametrize(
@@ -83,6 +57,20 @@ def test_resolve_session_label_prefers_specific_over_x_session_id():
 def test_resolve_session_label_specific_after_fallback_still_wins():
     headers = {"x-session-id": "fallback", "x-opencode-session": "specific"}
     assert resolve_session_label(headers) == "specific"
+
+
+def test_resolve_session_header_returns_name_and_value():
+    assert resolve_session_header({"x-session-affinity": "aff"}) == (
+        "x-session-affinity",
+        "aff",
+    )
+    assert resolve_session_header({"X-Session-ID": "sid"}) == ("X-Session-ID", "sid")
+    assert resolve_session_header({}) == (None, None)
+
+
+def test_resolve_session_header_prefers_specific_name():
+    headers = {"X-Session-ID": "fallback", "x-opencode-session": "specific"}
+    assert resolve_session_header(headers) == ("x-opencode-session", "specific")
 
 
 def test_build_forward_headers_forwards_client_headers():
@@ -145,13 +133,14 @@ def test_build_forward_headers_injects_session_header():
     assert forwarded["x-opencode-session"] == "sess-1"
 
 
-def test_build_forward_headers_does_not_override_existing_session_header():
+def test_build_forward_headers_overrides_existing_session_header():
+    # PCM owns the endpoint session header: a client-supplied value is replaced.
     forwarded = build_forward_headers(
         {"x-opencode-session": "client-provided"},
         session_header="x-opencode-session",
         session_id="resolved",
     )
-    assert forwarded["x-opencode-session"] == "client-provided"
+    assert forwarded["x-opencode-session"] == "resolved"
 
 
 def test_build_forward_headers_no_session_injection_without_config():

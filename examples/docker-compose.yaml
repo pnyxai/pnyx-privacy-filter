@@ -83,6 +83,9 @@ services:
       # for the OpenCode Zen gateway, "X-Hermes-Session-Id" for Hermes).
       # Leave empty for upstreams that need none (vLLM, OpenRouter, OpenAI).
       PCM_LLM_SESSION_HEADER: ${PCM_LLM_SESSION_HEADER:-}
+      # Optional allowlist of alternate downstream URLs selectable per request
+      # via the X-PCM-LLM-URL header (comma-separated). Empty disables it.
+      PCM_LLM_URL_ALLOWLIST: ${PCM_LLM_URL_ALLOWLIST:-}
       # PCM talks to Triton by service name on the shared network
       PCM_TRITON_URL:       pnyx-pf-triton:8000
       PCM_TRITON_MODEL_NAME: ensemble_model
@@ -90,14 +93,22 @@ services:
       # at natural boundaries and redacted chunk by chunk.
       PCM_TRITON_MAX_CHARS: ${PCM_TRITON_MAX_CHARS:-8000}
       PCM_DB_PATH:          ${PCM_DB_PATH}
+      # Session time-to-live from last activity (m/h/d/w; integer or float).
+      # Empty/0 disables expiry. Sweep interval uses the same syntax.
+      PCM_SESSION_TTL:       ${PCM_SESSION_TTL:-}
+      PCM_SESSION_TTL_SWEEP: ${PCM_SESSION_TTL_SWEEP:-10m}
       PCM_LOG_LEVEL:        ${PCM_LOG_LEVEL}
       # Comma-separated verbose event names to emit at DEBUG level (requires PCM_LOG_LEVEL=DEBUG).
       # Available: request_body, redaction_result, llm_payload, llm_raw_response, session_state, response_body
       # Use * to enable all. Default: empty (none).
       PCM_VERBOSE_LOG_EVENTS: ${PCM_VERBOSE_LOG_EVENTS}
-      # Comma-separated roles sent through the Triton privacy filter.
-      # Default: user,tool,function — add "system" to also redact system prompts.
-      PCM_FILTERABLE_ROLES: ${PCM_FILTERABLE_ROLES}
+      # Privacy filtering scope (default-deny): roles/fields to pass through.
+      # Empty = redact everything. The *_FRESH sets apply to fresh conversations
+      # and do not inherit the resumed sets.
+      PCM_PASSTHROUGH_ROLES: ${PCM_PASSTHROUGH_ROLES:-}
+      PCM_PASSTHROUGH_ROLES_FRESH: ${PCM_PASSTHROUGH_ROLES_FRESH:-}
+      PCM_PASSTHROUGH_FIELDS: ${PCM_PASSTHROUGH_FIELDS:-}
+      PCM_PASSTHROUGH_FIELDS_FRESH: ${PCM_PASSTHROUGH_FIELDS_FRESH:-}
       # Comma-separated labels the streaming de-anonymiser recognises.
       # Defaults to the openai/privacy-filter v2 taxonomy when unset.
       PCM_PLACEHOLDER_LABELS: ${PCM_PLACEHOLDER_LABELS}

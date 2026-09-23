@@ -725,10 +725,81 @@ async def test_streaming_forwards_model_and_injects_session_header(make_client):
     )
 
     assert status == 200
-    assert session_id.startswith("sess-stream::")
+    assert session_id == "sess-stream"
     upstream = route.calls.last.request
     assert json.loads(upstream.content)["model"] == "minimax-m3"
     assert upstream.headers.get("x-opencode-session") == session_id
+
+
+@pytest.mark.asyncio
+@respx.mock
+async def test_streaming_preserves_client_session_header_name(client):
+    body = stream_body(
+        [
+            chunk({"role": "assistant", "content": "hi"}),
+            chunk({}, finish_reason="stop"),
+        ]
+    )
+    respx.post(LLM_URL).mock(
+        return_value=httpx.Response(
+            200, content=body.encode(), headers={"content-type": "text/event-stream"}
+        )
+    )
+    payload = {
+        "model": "minimax-m3",
+        "messages": [{"role": "user", "content": "hi"}],
+        "stream": True,
+    }
+    async with client.stream(
+        "POST",
+        "/v1/chat/completions",
+        json=payload,
+        headers={"x-session-affinity": "aff-s"},
+    ) as response:
+        assert response.headers["x-session-affinity"] == "aff-s"
+        assert response.headers["x-session-id"] == "aff-s"
+        async for _ in response.aiter_lines():
+            pass
+
+
+@pytest.mark.asyncio
+@respx.mock
+async def test_reasoning_only_stream_persists_user_turn(client):
+    """A reasoning-only assistant turn must still persist the session.
+
+    Some models (e.g. a reasoning model behind vLLM) return only a reasoning
+    channel and no ``content``.  Reasoning is never persisted, but the user turn
+    must be saved so the conversation can continue instead of vanishing.
+    """
+    body = stream_body(
+        [
+            chunk({"role": "assistant", "content": ""}),
+            chunk({"reasoning": "Let me think about <PRIVATE_PERSON_1>."}),
+            chunk({}, finish_reason="stop"),
+        ]
+    )
+    respx.post(LLM_URL).mock(
+        return_value=httpx.Response(
+            200, content=body.encode(), headers={"content-type": "text/event-stream"}
+        )
+    )
+    status, session_id, _, _, _ = await collect_events(
+        client,
+        {
+            "model": "m",
+            "messages": [{"role": "user", "content": "My name is Lionel Messi"}],
+            "stream": True,
+        },
+    )
+    assert status == 200
+
+    inspect = await client.get(f"/v1/sessions/{session_id}")
+    assert inspect.status_code == 200
+    session = inspect.json()
+    assert session["hidden_messages"][0]["role"] == "user"
+    # Reasoning is not persisted as an assistant message.
+    assert not any(m.get("role") == "assistant" for m in session["hidden_messages"])
+
 
 
 
