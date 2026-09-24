@@ -18,12 +18,9 @@ import httpx
 import pytest
 import respx
 
+from app.identity import compute_prefix_user_hash, compute_user_hash
 from app.models import SessionData
-from app.privacy_manager import (
-    compute_prefix_user_hash,
-    compute_user_hash,
-    resolve_session,
-)
+from app.privacy_manager import resolve_session
 from app.session_store import ensure_schema, save_session
 
 LLM_URL = "http://llm.local/v1/chat/completions"
@@ -136,6 +133,10 @@ async def test_resolve_matches_by_hash_without_header(settings):
     async with aiosqlite.connect(settings.db_path) as conn:
         first = await resolve_session(conn, None, messages, settings)
         first.user_hash = compute_user_hash(messages)
+        first.raw_messages = [
+            {"role": "user", "content": "hi"},
+            {"role": "assistant", "content": "ok"},
+        ]
         await save_session(conn, first)
 
         resumed = await resolve_session(
@@ -180,9 +181,13 @@ async def test_collision_picks_an_existing_session(settings):
         {"role": "user", "content": "next"},
     ]
     prefix = compute_prefix_user_hash(messages)
+    history = [
+        {"role": "user", "content": "hi"},
+        {"role": "assistant", "content": "a"},
+    ]
     async with aiosqlite.connect(settings.db_path) as conn:
-        await _save(conn, session_id="a", user_hash=prefix)
-        await _save(conn, session_id="b", user_hash=prefix)
+        await _save(conn, session_id="a", user_hash=prefix, raw_messages=list(history))
+        await _save(conn, session_id="b", user_hash=prefix, raw_messages=list(history))
         picked = await resolve_session(conn, None, messages, settings)
     assert picked.session_id in {"a", "b"}
 
@@ -196,6 +201,10 @@ async def test_rotated_header_rebinds_to_hash_match(settings):
             session_id="s1",
             client_x_session_header="old-id",
             user_hash=compute_user_hash([{"role": "user", "content": "hello"}]),
+            raw_messages=[
+                {"role": "user", "content": "hello"},
+                {"role": "assistant", "content": "ok"},
+            ],
         )
         # A sub-agent starts sending a brand-new id mid-conversation.
         resumed = await resolve_session(

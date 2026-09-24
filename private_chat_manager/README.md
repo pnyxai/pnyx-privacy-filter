@@ -67,7 +67,7 @@ Each session stores two session ids plus a conversation hash:
 | --- | --- |
 | `client_x_session_header` | The id in the client↔PCM namespace — what the client sent, or the `auto-<hash>` id PCM assigned and returned in `X-Session-ID`. |
 | `endpoint_x_session_header` | The id in the PCM↔endpoint namespace — sent upstream under the endpoint's session header (e.g. `x-opencode-session`). PCM owns this value and overrides any client-supplied one. |
-| `user_hash` | Merkle root over the *answered* user messages, updated after each turn. Each turn's root is also appended to the `session_hashes` table (see [Cursor alignment](#cursor-alignment-undo-and-branching)) so an undo can be matched back to its session. |
+| `user_hash` | Merkle root over the *answered* user messages, updated after each turn. Every answered-user prefix root is also recorded in `session_hashes` (see [Cursor alignment](#cursor-alignment-undo-and-branching)) so a future request — a new turn, a tool continuation, or an undo — can be matched back to its session, including a session created or forked mid-conversation. |
 
 A conversation is identified by **message content**, not by the client id:
 
@@ -83,6 +83,20 @@ A conversation is identified by **message content**, not by the client id:
 * When several sessions share the same history (identical prefixes, such as an
   agent's title generator and its main chat), the one that shares the **most
   messages** wins; a true tie is broken at random.
+* A hash (or client-header) match must **share conversation content** to own a
+  request: at least one matching message beyond the leading system prompt. A
+  session that shares nothing — or only the system prompt — starts a new
+  conversation instead of forking an unrelated one. This keeps a side-channel
+  such as a title generator (whose opening user message collides but whose
+  system prompt/history differs) from shadowing the real chat, even when the
+  client sends no session header.
+* A one-off change to the system prompt or opening user message (e.g. a harness
+  that reports a different `Provider:` on the turn where the model changes) is
+  detected as divergence: PCM starts a new root, re-redacts that turn once, and
+  then continues linearly — the change is not propagated across later turns.
+  (Making the system prompt replaceable rather than part of the compared prefix
+  is out of scope; client histories that change the system prompt *every* turn
+  would therefore start a new root each turn.)
 
 The endpoint session id is derived by PCM from the **effective per-request
 endpoint policy**: a well-formed client value is reused, otherwise a fresh one
@@ -107,9 +121,16 @@ common prefix (LCP)** between the client's replayed `messages` and the stored
 `raw_messages`. `_same_message` compares role, content and **every** semantic
 tool-call field (`tool_calls`, `tool_call_id`, `name`, and the legacy
 `function_call` / `function_calls`), so an edit to a call's arguments or function
-name — not only its id — is detected as divergence and re-redacted. The
-`reasoning`/`refusal` side channels are intentionally ignored (the client may or
-may not echo them). The LCP length is the cursor; everything after it is new.
+name — not only its id — is detected as divergence and re-redacted. Two
+client-replay artefacts are normalised so they are not mistaken for an edit:
+an omitted/`null` content and `""` both mean "no text"; and tool-call
+`arguments` are compared as **canonical JSON** (parsed, `sort_keys`, compact
+separators), because clients re-serialise a call's parsed arguments before
+replaying history (whitespace/key-order changes). The call's id/type/name stay
+byte-exact and a non-JSON arguments string falls back to an exact comparison, so
+a real edit to a call is still detected. The `reasoning`/`refusal` side channels
+are intentionally ignored (the client may or may not echo them). The LCP length
+is the cursor; everything after it is new.
 
 The governing rule:
 
@@ -147,11 +168,14 @@ Session lookup gathers candidates from three sources — the client session head
 the current `user_hash`, and the per-turn historical prefix roots
 (`session_hashes`) — and picks the one that shares the **longest run of raw
 messages** with the request; an exact `user_hash` match only breaks ties (ties on
-byte-identical prefixes are broken at random). Scoring by the shared messages
-keeps a side-channel session — for example a title generator whose single user
-message collides with the conversation's opening, so its `user_hash` equals the
-conversation's first answered-user prefix — from shadowing the real conversation,
-which shares the actual messages.
+byte-identical prefixes are broken at random). A candidate is only eligible to
+own the request when that shared run contains **at least one non-system
+message**; a match on nothing (or only the leading system prompt) starts a new
+conversation instead. Scoring by the shared messages keeps a side-channel
+session — for example a title generator whose single user message collides with
+the conversation's opening, so its `user_hash` equals the conversation's first
+answered-user prefix — from shadowing the real conversation, which shares the
+actual messages.
 
 - **With a session header**, that header is only a hint: it never overrides the
   messages. A strict-prefix undo is honoured only when the incoming history has a
@@ -179,8 +203,13 @@ queryable:
 | `root_session_id` | The shared root of the whole conversation tree (a root session points at itself). Indexed. |
 | `origin_message_count` | How many messages were inherited from the parent at the fork point. |
 
-`session_hashes` also stores the `message_count` at each recorded root (the turn
-boundary), so a matched historical root maps directly to a cursor. This is
+`session_hashes` records **every** answered-user prefix root of a session's
+history (not only the final one), each with the `message_count` at that root
+(the turn boundary), so a matched historical root maps directly to a cursor.
+Because a fork's `raw_messages` carries the inherited prefix, deriving its roots
+reproduces the parent's boundaries for the child without an explicit copy — so
+even a session created or forked mid-conversation is discoverable by the exact
+prefix a future request computes (a hash-keyed, indexed lookup). This is also
 groundwork for future **forking** (list branches of a conversation, fork at
 message N, rebuild the tree) — those are query/API work over these columns.
 
@@ -525,6 +554,7 @@ with `method`/`path` instead of `session_id`/`model`.
 | `app/config.py` | `Settings` (pydantic-settings, env vars) |
 | `app/models.py` | Pydantic models: request, response, session state |
 | `app/privacy_manager.py` | Session preparation, placeholder indexing, buffered + streaming handlers |
+| `app/identity.py` | Pure conversation-identity helpers (Merkle `user_hash`/prefix roots, content normalisation), shared by resolution and persistence |
 | `app/message_fields.py` | Registry of the text-bearing fields inside a chat message (default-deny) |
 | `app/endpoints.py` | Endpoint registry: `PCM_LLM_URL` → session-header policy (matchers, validate/generate) |
 | `app/headers.py` | Generic HTTP header helpers (session-header resolution, forwarding, redaction) |
