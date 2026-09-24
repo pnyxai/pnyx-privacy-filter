@@ -5,6 +5,7 @@ import time
 
 import aiosqlite
 
+from .identity import user_hash_prefixes
 from .models import PrivacyFilterState, SessionData
 
 _CREATE_TABLE_SQL = """
@@ -61,10 +62,12 @@ _CREATE_ROOT_INDEX_SQL = (
 # (list the branches of a conversation, fork at message N, reconstruct the tree)
 # is a query/API exercise rather than a schema migration.
 
-# History of the user-message Merkle root after every turn.  The current root is
-# also on ``sessions.user_hash``; this table additionally remembers every earlier
-# prefix root, so a headerless undo/rewind can be matched back to its session and
-# only the changed tail needs re-redacting.  ``message_count`` is the history
+# History of the answered-user prefix Merkle roots of a session's messages, one
+# per user turn.  The final root is also on ``sessions.user_hash``; this table
+# additionally records every earlier prefix root, so a headerless undo/rewind —
+# or a continuation whose prefix lags the final hash (a tool continuation, or a
+# session created/forked mid-conversation) — can be matched back to its session
+# and only the changed tail needs re-redacting.  ``message_count`` is the history
 # length at that root (the turn boundary), and the composite primary key doubles
 # as the lookup index on ``user_hash``.
 _CREATE_SESSION_HASHES_SQL = """
@@ -286,18 +289,28 @@ async def save_session(conn: aiosqlite.Connection, data: SessionData) -> None:
             data.origin_message_count,
         ),
     )
-    # Remember this turn's user-message root so a later headerless undo can be
-    # matched back to this session (see find_sessions_by_historical_user_hash).
-    # ``message_count`` records the turn boundary for that root.
+    # Remember every answered-user prefix root so a later request — a new turn,
+    # a tool continuation, or a headerless undo/rewind — can be matched back to
+    # this session (see find_sessions_by_historical_user_hash).  Registering all
+    # prefix roots (not only the final one) is what makes a session that was
+    # created or forked mid-conversation discoverable by the exact prefix a
+    # future request computes: its inherited prefix roots come from its own
+    # ``raw_messages``, so no explicit copy from the parent is needed.
+    # ``message_count`` records the turn boundary for each root.
+    roots: dict[str, int] = dict(user_hash_prefixes(data.raw_messages))
     if data.user_hash:
-        await conn.execute(
-            "INSERT OR IGNORE INTO session_hashes "
-            "(user_hash, session_id, created_at, message_count) VALUES (?, ?, ?, ?)",
-            (
-                data.user_hash,
-                data.session_id,
-                data.created_at,
-                len(data.raw_messages),
-            ),
-        )
+        # The authoritative final root (equals the last derived root in normal
+        # use; kept explicitly so a session with an empty raw history still
+        # records the root it was saved with).  Deduped by hash so a caller that
+        # sets a non-derived ``user_hash`` cannot register the same hash twice.
+        roots.setdefault(data.user_hash, len(data.raw_messages))
+    await conn.executemany(
+        "INSERT OR IGNORE INTO session_hashes "
+        "(user_hash, session_id, created_at, message_count) VALUES (?, ?, ?, ?)",
+        [
+            (user_hash, data.session_id, data.created_at, message_count)
+            for user_hash, message_count in roots.items()
+            if user_hash
+        ],
+    )
     await conn.commit()

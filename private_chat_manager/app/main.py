@@ -17,10 +17,9 @@ from .headers import (
     build_response_headers,
     resolve_session_header,
 )
+from .identity import compute_prefix_user_hash, compute_user_hash
 from .models import PrivateChatRequest, SessionInspectResponse
 from .privacy_manager import (
-    compute_prefix_user_hash,
-    compute_user_hash,
     handle_request,
     handle_stream_request,
     prepare_request,

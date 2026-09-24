@@ -12,8 +12,9 @@ import time
 import aiosqlite
 import pytest
 
+from app.identity import compute_user_hash
 from app.models import SessionData
-from app.privacy_manager import compute_user_hash, resolve_session
+from app.privacy_manager import resolve_session
 from app.session_store import (
     ensure_schema,
     purge_expired_sessions,
@@ -116,6 +117,10 @@ async def test_resolve_touches_existing_session(settings):
         await conn.execute("PRAGMA journal_mode=WAL")
         first = await resolve_session(conn, None, messages, ttl_settings)
         first.user_hash = compute_user_hash(messages)
+        first.raw_messages = [
+            {"role": "user", "content": "hi"},
+            {"role": "assistant", "content": "ok"},
+        ]
         # Live, but near the expiry boundary.
         stale = time.time() - 50
         first.updated_at = stale

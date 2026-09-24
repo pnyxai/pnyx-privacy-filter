@@ -11,8 +11,9 @@ import time
 import aiosqlite
 import pytest
 
+from app.identity import compute_user_hash
 from app.models import SessionData
-from app.privacy_manager import compute_user_hash, resolve_session
+from app.privacy_manager import resolve_session
 from app.session_store import ensure_schema, purge_expired_sessions, save_session
 
 

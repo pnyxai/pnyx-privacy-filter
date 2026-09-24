@@ -2,7 +2,6 @@ from __future__ import annotations
 
 import asyncio
 import copy
-import hashlib
 import json
 import random
 import time
@@ -19,6 +18,7 @@ from ._logging import get_logger
 from .config import Settings
 from .endpoints import endpoint_session_policy
 from .headers import build_forward_headers, redact_headers
+from .identity import compute_prefix_user_hash, compute_user_hash
 from .message_fields import message_fields
 from .models import PrivacyFilterState, PrivateChatRequest, SessionData
 from .session_store import (
@@ -122,26 +122,6 @@ def deanonymize_text(text: str, placeholder_map: dict[str, str]) -> str:
     return text
 
 
-def _extract_text_content(content: str | list | None) -> str:
-    """Return the plain-text body of a message content field.
-
-    Handles both the simple ``str`` form and the multi-part ``list`` form used
-    by vision/audio requests (only ``"text"`` parts are extracted).
-    """
-    if content is None:
-        return ""
-    if isinstance(content, str):
-        return content
-    # Multi-part content list
-    parts: list[str] = []
-    for part in content:
-        if isinstance(part, dict) and part.get("type") == "text":
-            parts.append(part.get("text", ""))
-        elif isinstance(part, str):
-            parts.append(part)
-    return " ".join(parts)
-
-
 def _strip_none(d: dict[str, Any]) -> dict[str, Any]:
     """Return a shallow copy of *d* with all None-valued keys removed."""
     return {k: v for k, v in d.items() if v is not None}
@@ -160,19 +140,121 @@ def _assistant_has_output(msg: Mapping[str, Any]) -> bool:
     return bool(msg.get("content")) or bool(msg.get("tool_calls"))
 
 
+def _canonicalize_arguments(value: Any) -> Any:
+    """Canonical JSON wire form of a tool-call ``arguments`` string.
+
+    Clients parse a tool call's arguments and re-serialise them before replaying
+    history, so the byte string a session stored (the model's original output)
+    can differ from the client's re-emission by whitespace or key order even
+    though the call is semantically identical.  Normalising both sides to
+    canonical JSON (``sort_keys`` + compact separators) removes that noise while
+    still detecting a real edit.  A non-JSON string falls back to itself, so the
+    comparison degrades to exact bytes rather than failing.
+
+    Adapted from the Hermes agent project (gathered 2026-09-24 at commit
+    ``c7c2df1a5``):
+
+    * ``agent/conversation_loop.py::_canonicalize_tool_call_arguments``
+    * ``agent/conversation_loop.py::_canonicalize_api_tool_calls``
+    
+    Hermes' form (compact + key-sorted) is used here because it is the stronger
+    canonical form: it absorbs OpenCode's order-preserving output as well.
+    """
+    if not isinstance(value, str):
+        return value
+    try:
+        return json.dumps(json.loads(value), sort_keys=True, separators=(",", ":"))
+    except (ValueError, TypeError, RecursionError):
+        # ValueError: not JSON (or not a JSON value PCM can round-trip).
+        # RecursionError: pathologically nested JSON; compare the raw bytes
+        # rather than fail the request.
+        return value
+
+
+def _tool_fields_equal(stored: Mapping[str, Any], client: Mapping[str, Any]) -> bool:
+    """Whether two messages' semantic tool-call fields are equal.
+
+    ``id`` / ``type`` / ``name`` are compared exactly; each call's ``arguments``
+    string is compared as canonical JSON (see :func:`_canonicalize_arguments`).
+    Handles the OpenAI ``tool_calls`` shape plus the legacy ``function_call``
+    (single object) and ``function_calls`` (list) shapes.
+    """
+    if stored.get("name") != client.get("name"):
+        return False
+    if stored.get("tool_call_id") != client.get("tool_call_id"):
+        return False
+
+    def _normalise_calls(calls: Any) -> Any:
+        if not isinstance(calls, list):
+            return calls
+        normalised: list[Any] = []
+        for call in calls:
+            if not isinstance(call, Mapping):
+                normalised.append(call)
+                continue
+            call = dict(call)
+            fn = call.get("function")
+            if isinstance(fn, Mapping):
+                fn = dict(fn)
+                if "arguments" in fn:
+                    fn["arguments"] = _canonicalize_arguments(fn["arguments"])
+                call["function"] = fn
+            elif "arguments" in call:
+                # Legacy ``function_calls`` entries carry ``arguments`` inline.
+                call["arguments"] = _canonicalize_arguments(call["arguments"])
+            normalised.append(call)
+        return normalised
+
+    def _normalise_single(call: Any) -> Any:
+        if not isinstance(call, Mapping):
+            return call
+        call = dict(call)
+        if "arguments" in call:
+            call["arguments"] = _canonicalize_arguments(call["arguments"])
+        return call
+
+    return (
+        _normalise_calls(stored.get("tool_calls"))
+        == _normalise_calls(client.get("tool_calls"))
+        and _normalise_calls(stored.get("function_calls"))
+        == _normalise_calls(client.get("function_calls"))
+        and _normalise_single(stored.get("function_call"))
+        == _normalise_single(client.get("function_call"))
+    )
+
+
+def _normalize_content(value: Any) -> Any:
+    """Canonical form of a message ``content`` for identity comparison.
+
+    A tool-call assistant turn has no text, and clients disagree on how to spell
+    that: PCM persists the model's ``null`` (``_strip_none`` drops the key), while
+    a client may replay ``content: ""``.  Both mean "no text", so they compare
+    equal.  Non-empty content (including a multimodal list) is compared exactly.
+    """
+    if value is None or value == "":
+        return None
+    return value
+
+
 def _same_message(stored: Mapping[str, Any], client: Mapping[str, Any]) -> bool:
     """Whether a stored raw message matches the client's replayed message.
 
     ``raw_messages`` holds exactly what the client sent (user/system/tool) or
-    the de-anonymised assistant reply it received, so a matching client message
-    is byte-identical.  Compared on role, content and every semantic tool-call
-    field — not the reasoning/refusal side channels, which the client may or may
-    not echo.
+    the de-anonymised assistant reply it received.  Compared on role and content,
+    plus every semantic tool-call field — not the reasoning/refusal side
+    channels, which the client may or may not echo.
 
-    Every tool-call field (arguments, function name, ids and the legacy
-    ``function_call``/``function_calls`` shapes) is compared so that an edit to
-    a call — not just its id — is detected as divergence and re-redacted on a
-    new branch rather than silently skipped in favour of the cached hidden copy.
+    Two client-replay artefacts are normalised so they are not mistaken for an
+    edit (which would fork the conversation):
+
+    * **content** — an omitted/``null`` content and ``""`` both mean "no text"
+      (see :func:`_normalize_content`);
+    * **tool-call arguments** — compared as canonical JSON, since clients
+      re-serialise a call's parsed arguments before replaying history (see
+      :func:`_canonicalize_arguments`).  The call's id/type/name stay byte-exact,
+      so a real edit to a call — or its id — is still detected and re-redacted on
+      a new branch rather than silently skipped in favour of the cached hidden
+      copy.
 
     NOTE (future forking): this is a whole-message comparison.  Giving each
     stored message a stable identity (a message id or content hash) would allow
@@ -180,16 +262,11 @@ def _same_message(stored: Mapping[str, Any], client: Mapping[str, Any]) -> bool:
     """
     if stored.get("role") != client.get("role"):
         return False
-    if stored.get("content") != client.get("content"):
+    if _normalize_content(stored.get("content")) != _normalize_content(
+        client.get("content")
+    ):
         return False
-    semantic_fields = (
-        "name",
-        "tool_call_id",
-        "tool_calls",
-        "function_call",
-        "function_calls",
-    )
-    return all(stored.get(key) == client.get(key) for key in semantic_fields)
+    return _tool_fields_equal(stored, client)
 
 
 def _common_prefix_len(stored: list[dict[str, Any]], client: list[dict[str, Any]]) -> int:
@@ -240,6 +317,36 @@ def _matching_prefix_len(
     if allow_rewind and 0 < shared == len(client) < len(stored):
         return shared
     return 0
+
+
+def _eligible_shared_len(
+    stored: list[dict[str, Any]],
+    client: list[dict[str, Any]],
+    *,
+    allow_rewind: bool,
+) -> int:
+    """Shared-prefix length a candidate must reach to be allowed to own *client*.
+
+    A ``user_hash`` (or client-header) match is not enough on its own: a
+    side-channel session such as a title generator can carry the same
+    answered-user prefix as the real conversation while sharing no history with
+    it (its system prompt, or its opening user message, differs).  Such a match
+    must not own the request — doing so would fork an unrelated session at
+    cursor 0 and re-redact the whole history in the wrong lineage.
+
+    A candidate is therefore eligible only when it shares at least one message
+    **and** that shared run contains at least one non-``system`` message.  A run
+    consisting solely of the leading system prompt is not evidence that the two
+    histories are the same conversation (system prompts are shared across many
+    conversations and may themselves carry redactions), so it too starts a new
+    conversation instead.
+    """
+    shared = _matching_prefix_len(stored, client, allow_rewind=allow_rewind)
+    if shared <= 0:
+        return 0
+    if not any(message.get("role") != "system" for message in client[:shared]):
+        return 0
+    return shared
 
 
 # Client-supplied messages are untrusted, so a configured pass-through is
@@ -300,61 +407,6 @@ def _upstream_error_detail(response: httpx.Response) -> Any:
     except ValueError:
         text = response.text
         return text[:2000] if text else "Upstream LLM error"
-
-
-def _merkle_root(leaves: list[str]) -> str:
-    """Return the Merkle root of ordered hex-digest *leaves*.
-
-    Leaves are domain-separated (``\\x00``) from internal nodes (``\\x01``) to
-    avoid second-preimage ambiguity.  An odd node is duplicated at each level.
-    """
-    if not leaves:
-        return ""
-    nodes = [
-        hashlib.sha256(b"\x00" + bytes.fromhex(leaf)).digest() for leaf in leaves
-    ]
-    while len(nodes) > 1:
-        if len(nodes) % 2:
-            nodes.append(nodes[-1])
-        nodes = [
-            hashlib.sha256(b"\x01" + nodes[i] + nodes[i + 1]).digest()
-            for i in range(0, len(nodes), 2)
-        ]
-    return nodes[0].hex()
-
-
-def _user_message_digest(message: Mapping[str, Any]) -> str:
-    content = _extract_text_content(message.get("content"))
-    return hashlib.sha256(content.encode("utf-8")).hexdigest()
-
-
-def compute_user_hash(messages: list[dict[str, Any]]) -> str:
-    """Merkle root over the ordered ``role == "user"`` messages.
-
-    Returns the empty string when there are no user messages (e.g. before any
-    user turn has been answered).
-    """
-    leaves = [
-        _user_message_digest(message)
-        for message in messages
-        if message.get("role") == "user"
-    ]
-    return _merkle_root(leaves)
-
-
-def compute_prefix_user_hash(messages: list[dict[str, Any]]) -> str:
-    """Hash of the *answered* user messages (all but the last user message).
-
-    The final user message is the new, not-yet-answered turn and must not take
-    part in matching the session that should answer it.
-    """
-    last_user_index: int | None = None
-    for index, message in enumerate(messages):
-        if message.get("role") == "user":
-            last_user_index = index
-    if last_user_index is None:
-        return ""
-    return compute_user_hash(messages[:last_user_index])
 
 
 def _collect_text(messages: list[dict[str, Any]]) -> str:
@@ -528,7 +580,8 @@ async def resolve_session(
     """Recover (or create) the session that owns *messages*.
 
     Message content is the source of truth: a conversation is identified by the
-    Merkle hash of its answered user messages (see :func:`compute_prefix_user_hash`).
+    Merkle hash of its answered user messages (see
+    :func:`app.identity.compute_prefix_user_hash`).
     A client-supplied session id is only a hint — it selects a session when its
     hash agrees with the incoming history, but can never override the hash.
 
@@ -582,6 +635,12 @@ async def resolve_session(
     # title generator whose single user message collides with the conversation's
     # opening) from shadowing the real conversation, which shares the messages.
     # Byte-identical prefixes (a genuine hash collision) are broken at random.
+    #
+    # A candidate must genuinely share conversation content (see
+    # :func:`_eligible_shared_len`): a hash match with zero shared messages, or
+    # with only the leading system prompt, is not enough to own the request.
+    # Otherwise a new conversation starts, which keeps the lineage honest (a
+    # side-channel can no longer be forked at cursor 0).
     candidates: dict[str, SessionData] = {}
     for sessions in (header_sessions, by_hash, by_history):
         for session in sessions:
@@ -590,9 +649,11 @@ async def resolve_session(
     best_score = (0, False)  # (shared prefix length, exact user-hash match)
     best: list[SessionData] = []
     for session in candidates.values():
-        shared = _matching_prefix_len(
+        shared = _eligible_shared_len(
             session.raw_messages, messages, allow_rewind=bool(prefix)
         )
+        if shared == 0:
+            continue
         exact = bool(prefix) and session.user_hash == prefix
         score = (shared, exact)
         if score > best_score:
